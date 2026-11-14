@@ -9,10 +9,11 @@ States, Processes, Inputs and Outputs Processing and Semantics Domain powered by
 from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from fractions import Fraction
 from math import isfinite
-from typing import ClassVar, Any, Optional, Callable, Optional, Sequence, Union
+from typing import ClassVar, Any, Optional, Callable, Optional, Sequence, Union, Mapping
 from abc import ABC, abstractmethod
 from uuid import uuid4, UUID
 
@@ -163,6 +164,46 @@ class VariableElement(StateElement):
         raise AttributeError("Lee o modifica el valor mediante el SystemState propietario."
 )
 
+
+DiscreteValue = Union[str, int, bool, Enum]
+
+
+class DiscreteStateElement(StateElement):
+    def __init__(
+        self,
+        systemic_space: SystemicSpace,
+        name: str,
+        initial_value: Optional[DiscreteValue] = None,
+        allowed_values: Optional[Sequence[DiscreteValue]] = None,
+    ) -> None:
+        if not name:
+            raise ValueError("name no puede estar vacío.")
+        values = None if allowed_values is None else tuple(allowed_values)
+        if values is not None:
+            if not values:
+                raise ValueError("allowed_values no puede estar vacío.")
+            if len(set(values)) != len(values):
+                raise ValueError("allowed_values no puede contener duplicados.")
+            for value in values:
+                self._validate_type(value)
+        super().__init__(systemic_space)
+        self.name = name
+        self.allowed_values = values
+        self._value = (
+            None if initial_value is None else self.validate_value(initial_value)
+        )
+
+    @staticmethod
+    def _validate_type(value: Any) -> None:
+        if not isinstance(value, (str, int, bool, Enum)):
+            raise TypeError("Un valor discreto debe ser str, int, bool o Enum.")
+
+    def validate_value(self, value: DiscreteValue) -> DiscreteValue:
+        self._validate_type(value)
+        if self.allowed_values is not None and value not in self.allowed_values:
+            raise ValueError(f"El valor discreto '{value}' no está permitido.")
+        return value
+
 class DependentExpressionElement(StateElement):
 
     def __init__(self, systemic_space: SystemicSpace, name: str, expression: sym.Expr, constraints: Optional[ValueConstraints] = None,) -> None:
@@ -274,11 +315,15 @@ class SystemState(Entity):
 
         self.elements : dict[UUID, StateElement] = {}
         self._variables_by_name : dict[str, VariableElement] = {}
+        self._discrete_variables_by_name: dict[str, DiscreteStateElement] = {}
         self._expressions_by_symbol : dict[sym.Symbol, sym.Expr] = {}
 
         self.expressions : list[DependentExpressionElement] = []
         self.symbols : list[sym.Symbol] = []
         self._active_kernel: Optional[CompiledStateKernel] = None
+        self._history_recorders: list[
+            tuple[TemporalHistory, Callable[[], float]]
+        ] = []
 
     def add_element(self, element : UUID) -> None:
         entity_element = self.systemic_space.get(element)
@@ -292,12 +337,25 @@ class SystemState(Entity):
             existing_variable = self._variables_by_name.get(entity_element.name)
             if existing_variable is not None and existing_variable is not entity_element:
                 raise ValueError(f"Ya existe una variable llamada '{entity_element.name}' en este estado.")
+            if entity_element.name in self._discrete_variables_by_name:
+                raise ValueError(f"Ya existe un elemento llamado '{entity_element.name}' en este estado.")
+        if isinstance(entity_element, DiscreteStateElement):
+            existing_discrete = self._discrete_variables_by_name.get(
+                entity_element.name
+            )
+            if existing_discrete is not None and existing_discrete is not entity_element:
+                raise ValueError(f"Ya existe un elemento llamado '{entity_element.name}' en este estado.")
+            if entity_element.name in self._variables_by_name:
+                raise ValueError(f"Ya existe una variable llamada '{entity_element.name}' en este estado.")
 
         entity_element._owner_state_id = self.identificator.id
         self.elements[element] = entity_element
         if isinstance(entity_element, VariableElement):
             self._variables_by_name[entity_element.name] = entity_element
             self._active_kernel = None
+
+        elif isinstance(entity_element, DiscreteStateElement):
+            self._discrete_variables_by_name[entity_element.name] = entity_element
 
         elif isinstance(entity_element, DependentExpressionElement):
             if entity_element not in self.expressions:
@@ -318,13 +376,45 @@ class SystemState(Entity):
             )
         )
 
+    def read_discrete_value(self, element: UUID) -> DiscreteValue:
+        entity_element = self.elements.get(element)
+        if not isinstance(entity_element, DiscreteStateElement):
+            raise KeyError(
+                "Solo se puede leer un DiscreteStateElement de este estado."
+            )
+        if entity_element._value is None:
+            raise ValueError(
+                f"El elemento discreto '{entity_element.name}' no tiene valor asignado."
+            )
+        return entity_element.validate_value(entity_element._value)
+
+    def set_discrete_value(self, element: UUID, value: DiscreteValue) -> None:
+        entity_element = self.elements.get(element)
+        if not isinstance(entity_element, DiscreteStateElement):
+            raise KeyError(
+                "Solo se puede asignar valor a un DiscreteStateElement de este estado."
+            )
+        validated_value = entity_element.validate_value(value)
+        entity_element._value = validated_value
+        for history, time_provider in tuple(self._history_recorders):
+            now = time_provider()
+            history.record_discrete(
+                self.identificator.id,
+                element,
+                validated_value,
+                now,
+            )
+            history.record_state(self, now)
+
     def read_element(
         self,
         element: UUID,
-    ) -> Union[float, np.ndarray, sym.Lambda]:
+    ) -> Union[float, np.ndarray, sym.Lambda, DiscreteValue]:
         entity_element = self.elements.get(element)
         if isinstance(entity_element, VariableElement):
             return self.read_value(element)
+        if isinstance(entity_element, DiscreteStateElement):
+            return self.read_discrete_value(element)
         if isinstance(entity_element, DependentExpressionElement):
             kernel = self._active_kernel
             if kernel is None or entity_element.symbol not in kernel.target_symbols:
@@ -382,12 +472,19 @@ class SystemState(Entity):
         validated_updates = self.validate_values(updates)
         self._commit_validated_values(validated_updates)
 
-    def _commit_validated_values(self, updates: dict[UUID, float]) -> None:
+    def _commit_validated_values(
+        self,
+        updates: dict[UUID, float],
+        record_history: bool = True,
+    ) -> None:
         for element, value in updates.items():
             variable = self.elements[element]
             if not isinstance(variable, VariableElement):
                 raise TypeError("La variable validada dejó de pertenecer al estado.")
             variable._value = value
+        if record_history:
+            for history, time_provider in tuple(self._history_recorders):
+                history.record_state(self, time_provider())
 
     def compile_state(self, targets: dict[sym.Symbol, sym.Expr], custom_mappings: Optional[dict[str, Callable[..., Any]]] = None) -> CompiledStateKernel:
         """
@@ -555,6 +652,290 @@ class SystemState(Entity):
         for variable, value in updates.items():
             variable._value = value
 
+# =============================
+# SYSTEMS TEMPORAL MANAGEMENT
+# =============================
+
+@dataclass(frozen=True)
+class TrajectorySample:
+    simulation_time: float
+    state_id: UUID
+    values: Mapping[UUID, Union[float, DiscreteValue]]
+
+@dataclass(frozen=True)
+class DiscreteStateEvent:
+    simulation_time: float
+    state_id: UUID
+    element_id: UUID
+    value: Union[str, int, bool, Enum]
+
+class TemporalHistory:
+    """In-memory numeric trajectories and explicitly recorded discrete changes."""
+
+    def __init__(self) -> None:
+        self.samples: list[TrajectorySample] = []
+        self.discrete_events: list[DiscreteStateEvent] = []
+        self._attached_states: set[UUID] = set()
+
+    def attach_state(
+        self,
+        state: SystemState,
+        time_provider: Callable[[], float],
+    ) -> None:
+        if not isinstance(state, SystemState):
+            raise TypeError("state debe ser SystemState.")
+        if not callable(time_provider):
+            raise TypeError("time_provider debe ser invocable.")
+        if state.identificator.id in self._attached_states:
+            return
+        state._history_recorders.append((self, time_provider))
+        self._attached_states.add(state.identificator.id)
+        self.record_state(state, time_provider())
+
+    def record_state(
+        self,
+        state: SystemState,
+        simulation_time: float,
+    ) -> TrajectorySample:
+        values: dict[UUID, Union[float, DiscreteValue]] = {
+            element_id: float(element._value)
+            for element_id, element in state.elements.items()
+            if isinstance(element, VariableElement) and element._value is not None
+        }
+        values.update(
+            {
+                element_id: element._value
+                for element_id, element in state.elements.items()
+                if isinstance(element, DiscreteStateElement)
+                and element._value is not None
+            }
+        )
+        return self.record_values(state.identificator.id, simulation_time, values)
+
+    def record_values(
+        self,
+        state_id: UUID,
+        simulation_time: float,
+        values: Mapping[UUID, Union[float, DiscreteValue]],
+    ) -> TrajectorySample:
+        time_value = float(simulation_time)
+        if not isfinite(time_value):
+            raise ValueError("simulation_time debe ser finito.")
+        validated_values: dict[UUID, Union[float, DiscreteValue]] = {}
+        for element_id, value in values.items():
+            if isinstance(value, (str, bool, Enum)):
+                validated_values[element_id] = value
+            elif isinstance(value, int):
+                validated_values[element_id] = value
+            else:
+                numeric_value = float(value)
+                if not isfinite(numeric_value):
+                    raise ValueError("Los valores de trayectoria deben ser finitos.")
+                validated_values[element_id] = numeric_value
+        sample = TrajectorySample(time_value, state_id, validated_values)
+        self.samples.append(sample)
+        return sample
+
+    def record_discrete(
+        self,
+        state_id: UUID,
+        element_id: UUID,
+        value: DiscreteValue,
+        simulation_time: float,
+    ) -> DiscreteStateEvent:
+        DiscreteStateElement._validate_type(value)
+        time_value = float(simulation_time)
+        if not isfinite(time_value):
+            raise ValueError("simulation_time debe ser finito.")
+        event = DiscreteStateEvent(time_value, state_id, element_id, value)
+        self.discrete_events.append(event)
+        return event
+
+    def trajectory(self, state_id: UUID, element_id: UUID) -> ODETrajectory:
+        samples = [
+            (sample.simulation_time, sample.values[element_id])
+            for sample in self.samples
+            if sample.state_id == state_id and element_id in sample.values
+        ]
+        if not samples:
+            raise KeyError("No hay muestras para el estado y elemento indicados.")
+        if any(
+            isinstance(value, (bool, Enum))
+            or not isinstance(value, (int, float))
+            for _, value in samples
+        ):
+            raise TypeError("La trayectoria solicitada no es numérica.")
+        times = np.asarray([time_value for time_value, _ in samples], dtype=float)
+        values = np.asarray([value for _, value in samples], dtype=float)
+        return ODETrajectory(times, {element_id: values})
+
+@dataclass(frozen=True)
+class SimulationClock:
+    """Maps simulation seconds to an aware calendar origin."""
+
+    origin: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, datetime):
+            raise TypeError("origin debe ser datetime.")
+        if self.origin.tzinfo is None or self.origin.utcoffset() is None:
+            raise ValueError("origin debe incluir una zona horaria.")
+        round_trip = self.origin.astimezone(timezone.utc).astimezone(
+            self.origin.tzinfo
+        )
+        if round_trip.replace(tzinfo=None) != self.origin.replace(tzinfo=None):
+            raise ValueError("origin representa una hora local inexistente.")
+
+    def to_datetime(self, simulation_time: float) -> datetime:
+        time_value = float(simulation_time)
+        if not isfinite(time_value):
+            raise ValueError("simulation_time debe ser finito.")
+        instant = self.origin.astimezone(timezone.utc) + timedelta(
+            seconds=time_value
+        )
+        return instant.astimezone(self.origin.tzinfo)
+
+    def to_simulation_time(self, instant: datetime) -> float:
+        if not isinstance(instant, datetime):
+            raise TypeError("instant debe ser datetime.")
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("instant debe incluir una zona horaria.")
+        round_trip = instant.astimezone(timezone.utc).astimezone(instant.tzinfo)
+        if round_trip.replace(tzinfo=None) != instant.replace(tzinfo=None):
+            raise ValueError("instant representa una hora local inexistente.")
+        return (
+            instant.astimezone(timezone.utc)
+            - self.origin.astimezone(timezone.utc)
+        ).total_seconds()
+
+@dataclass(frozen=True)
+class ODETrajectory:
+    times: np.ndarray
+    values: dict[UUID, np.ndarray]
+
+class ODEIntegrator:
+    """Integrates selected scalar variables; time values and derivatives use seconds."""
+
+    def __init__(
+        self,
+        state: SystemState,
+        variable_ids: Sequence[UUID],
+        derivatives: Callable[
+            [float, np.ndarray],
+            Union[Sequence[float], np.ndarray],
+        ],
+    ) -> None:
+        if not isinstance(state, SystemState):
+            raise TypeError("state debe ser SystemState.")
+        variables = tuple(variable_ids)
+        if not variables or len(set(variables)) != len(variables):
+            raise ValueError("variable_ids debe contener variables únicas y no vacías.")
+        if not callable(derivatives):
+            raise TypeError("derivatives debe ser invocable.")
+        for element_id in variables:
+            if not isinstance(state.elements.get(element_id), VariableElement):
+                raise KeyError("Cada variable debe pertenecer al estado indicado.")
+        self.state = state
+        self.variable_ids = variables
+        self.derivatives = derivatives
+
+    def integrate(
+        self,
+        t_span: tuple[float, float],
+        t_eval: Optional[Sequence[float]] = None,
+        method: str = "RK45",
+        rtol: float = 1e-3,
+        atol: float = 1e-6,
+        commit: bool = True,
+    ) -> ODETrajectory:
+        """Integrate over seconds and commit only after the whole path validates."""
+        if len(t_span) != 2:
+            raise ValueError("t_span debe contener inicio y fin.")
+        start, end = (float(value) for value in t_span)
+        if not isfinite(start) or not isfinite(end) or end <= start:
+            raise ValueError("t_span requiere tiempos finitos con inicio < fin.")
+        if not isfinite(rtol) or rtol <= 0 or not isfinite(atol) or atol <= 0:
+            raise ValueError("rtol y atol deben ser finitos y positivos.")
+        evaluation_times = None if t_eval is None else np.asarray(t_eval, dtype=float)
+        if evaluation_times is not None and (
+            evaluation_times.ndim != 1
+            or len(evaluation_times) == 0
+            or not np.all(np.isfinite(evaluation_times))
+            or np.any(evaluation_times < start)
+            or np.any(evaluation_times > end)
+            or np.any(np.diff(evaluation_times) <= 0)
+        ):
+            raise ValueError("t_eval debe ser una secuencia creciente dentro de t_span.")
+        if (
+            commit
+            and evaluation_times is not None
+            and evaluation_times[-1] < end
+        ):
+            evaluation_times = np.append(evaluation_times, end)
+
+        initial_values = np.asarray(
+            [self.state.read_value(element_id) for element_id in self.variable_ids],
+            dtype=float,
+        )
+
+        def evaluate_derivatives(time_value: float, values: np.ndarray) -> np.ndarray:
+            result = np.asarray(self.derivatives(time_value, values.copy()), dtype=float)
+            if result.shape != initial_values.shape:
+                raise ValueError("derivatives debe devolver un valor por variable.")
+            if not np.all(np.isfinite(result)):
+                raise ValueError("derivatives produjo valores no finitos.")
+            return result
+
+        result = sci.integrate.solve_ivp(
+            evaluate_derivatives,
+            (start, end),
+            initial_values,
+            method=method,
+            t_eval=evaluation_times,
+            rtol=rtol,
+            atol=atol,
+        )
+        if not result.success:
+            raise RuntimeError(f"La integración ODE falló: {result.message}")
+        values_by_id = {
+            element_id: np.asarray(result.y[index], dtype=float).copy()
+            for index, element_id in enumerate(self.variable_ids)
+        }
+        for element_id, values in values_by_id.items():
+            variable = self.state.elements[element_id]
+            if not isinstance(variable, VariableElement):
+                raise TypeError("Una variable ODE dejó de pertenecer al estado.")
+            variable.constraints.validate(values, f"Trayectoria '{variable.name}'")
+
+        if commit:
+            final_values = {
+                element_id: float(values[-1])
+                for element_id, values in values_by_id.items()
+            }
+            validated = self.state.validate_values(final_values)
+            self.state._commit_validated_values(validated, record_history=False)
+            for history, _ in tuple(self.state._history_recorders):
+                for index, time_value in enumerate(result.t):
+                    sample_values = {
+                        element_id: float(element._value)
+                        for element_id, element in self.state.elements.items()
+                        if isinstance(element, VariableElement)
+                        and element._value is not None
+                    }
+                    sample_values.update(
+                        {
+                            element_id: float(values[index])
+                            for element_id, values in values_by_id.items()
+                        }
+                    )
+                    history.record_values(
+                        self.state.identificator.id,
+                        float(time_value),
+                        sample_values,
+                    )
+
+        return ODETrajectory(np.asarray(result.t, dtype=float).copy(), values_by_id)
+
 class StateTransducer:
     """Bridge between two states with explicitly granted variable write access."""
 
@@ -616,6 +997,7 @@ class ProcessTriggerKind(Enum):
     TOKEN_RECEIVED = auto()
     CONDITION = auto()
     INTERVAL = auto()
+    CALENDAR = auto()
 
 class ProcessValueScope(Enum):
     SYSTEM_STATE = auto()
@@ -738,7 +1120,19 @@ class ProcessExpression(Entity):
                     raise TypeError("El token activador no contiene un SystemState.")
             if reference.element_id is None:
                 raise ValueError("La referencia de estado carece de element_id.")
+            referenced_element = state.elements.get(reference.element_id)
+            if isinstance(referenced_element, DiscreteStateElement):
+                raise TypeError(
+                    "ProcessExpression solo puede leer valores numéricos."
+                )
             raw_value = state.read_element(reference.element_id)
+            if isinstance(raw_value, np.ndarray):
+                if raw_value.ndim != 0:
+                    raise ValueError(
+                        "Process requiere valores escalares en esta versión."
+                    )
+            elif not isinstance(raw_value, (int, float, np.number)):
+                raise TypeError("ProcessExpression solo puede leer valores numéricos.")
             if np.asarray(raw_value).ndim != 0:
                 raise ValueError("Process requiere valores escalares en esta versión.")
             result = float(raw_value)
@@ -859,6 +1253,7 @@ class ProcessTrigger(Entity):
         condition_id: Optional[UUID] = None,
         interval: Optional[float] = None,
         initial_delay: Optional[float] = None,
+        scheduled_at: Optional[datetime] = None,
     ) -> None:
         super().__init__(systemic_space)
         if kind is ProcessTriggerKind.TOKEN_RECEIVED and processor_id is None:
@@ -872,14 +1267,23 @@ class ProcessTrigger(Entity):
                 not np.isfinite(initial_delay) or initial_delay < 0
             ):
                 raise ValueError("initial_delay debe ser finito y no negativo.")
+        elif interval is not None:
+            raise ValueError("interval solo aplica al trigger INTERVAL.")
         elif initial_delay is not None:
             raise ValueError("initial_delay solo aplica al trigger INTERVAL.")
+        if kind is ProcessTriggerKind.CALENDAR:
+            if not isinstance(scheduled_at, datetime):
+                raise ValueError("CALENDAR requiere scheduled_at como datetime.")
+            SimulationClock(scheduled_at)
+        elif scheduled_at is not None:
+            raise ValueError("scheduled_at solo aplica al trigger CALENDAR.")
         self.identificator = Identification(entity=Ontology.EntityType.PROCESS_TRIGGER)
         self.kind = kind
         self.processor_id = processor_id
         self.condition_id = condition_id
         self.interval = interval
         self.initial_delay = initial_delay
+        self.scheduled_at = scheduled_at
         self.space_auto_registry()
 
 class ProcessAction(Entity):
@@ -960,6 +1364,8 @@ class Process(Entity):
 
         system = self.systemic_space.get(self.system_id)
         trigger = self.systemic_space.get(trigger_id)
+        if not np.isfinite(now):
+            raise ValueError("now debe ser un tiempo de simulación finito.")
 
         if not isinstance(system, System) or self.identificator.id not in system.processes:
             raise ValueError("Process debe estar suscrito al System declarado.")
@@ -1170,6 +1576,7 @@ class SystemProcessor(Entity):
                 ProcessTriggerKind.TOKEN_RECEIVED,
                 processor_id=self.identificator.id,
                 token_id=token_id,
+                now=system.simulation_time,
             )
 
     def process_token(self, token_id: UUID, transition: Callable[[StateTransducer, StateTransducer],TokenProcessingResult,], 
@@ -1335,6 +1742,10 @@ class SystemStructure(Entity):
         self.topology.add_node(entity_id)
         if isinstance(entity, Component):
             self.components[entity_id] = entity
+            if self.system_id is not None:
+                system = self.systemic_space.get(self.system_id)
+                if isinstance(system, System):
+                    system._attach_history_state(entity.system_state)
 
     def add_component(self, component : UUID) -> None:
         if not isinstance(self.systemic_space.get(component), Component):
@@ -2325,6 +2736,12 @@ class System(Entity):
 
         self._simpy_environment: Optional[sim.Environment] = None
         self._simpy_scheduled: set[tuple[UUID, UUID]] = set()
+        self._condition_edges: dict[tuple[UUID, UUID], bool] = {}
+        self._condition_poll_scheduled = False
+        self._condition_poll_interval: Optional[float] = None
+        self._simulation_time = 0.0
+        self._calendar_clock: Optional[SimulationClock] = None
+        self.history: Optional[TemporalHistory] = None
 
         self.SYSTEMIC_ATRIBUTES : dict[Any, Any] = {
             SystemStructure: self.structures,
@@ -2354,6 +2771,66 @@ class System(Entity):
         description_funnel[description] = description_entity
         if isinstance(description_entity, SystemProcessor):
             description_entity.system_id = self.identificator.id
+        if isinstance(description_entity, SystemState):
+            self._attach_history_state(description_entity)
+        elif isinstance(description_entity, SystemStructure):
+            for component in description_entity.components.values():
+                self._attach_history_state(component.system_state)
+
+    @property
+    def simulation_time(self) -> float:
+        if self._simpy_environment is not None:
+            return float(self._simpy_environment.now)
+        return self._simulation_time
+
+    @property
+    def simulation_datetime(self) -> Optional[datetime]:
+        if self._calendar_clock is None:
+            return None
+        return self._calendar_clock.to_datetime(self.simulation_time)
+
+    def enable_history(self) -> TemporalHistory:
+        if self.history is None:
+            self.history = TemporalHistory()
+        for state in self._states_for_history():
+            self._attach_history_state(state)
+        return self.history
+
+    def _states_for_history(self) -> tuple[SystemState, ...]:
+        states = dict(self.states)
+        for structure in self.structures.values():
+            for component in structure.components.values():
+                state = component.system_state
+                states[state.identificator.id] = state
+        return tuple(states.values())
+
+    def _attach_history_state(self, state: SystemState) -> None:
+        if self.history is not None:
+            self.history.attach_state(state, lambda: self.simulation_time)
+
+    def record_discrete(
+        self,
+        state_id: UUID,
+        element_id: UUID,
+        value: DiscreteValue,
+        simulation_time: Optional[float] = None,
+    ) -> DiscreteStateEvent:
+        if self.history is None:
+            raise RuntimeError("Activa el historial con enable_history() primero.")
+        state = next(
+            (
+                candidate
+                for candidate in self._states_for_history()
+                if candidate.identificator.id == state_id
+            ),
+            None,
+        )
+        if state is None:
+            raise KeyError("state_id no pertenece a este System.")
+        if element_id not in state.elements:
+            raise KeyError("element_id no pertenece al SystemState indicado.")
+        now = self.simulation_time if simulation_time is None else simulation_time
+        return self.history.record_discrete(state_id, element_id, value, now)
 
 # System Processes Control related Functions
 
@@ -2361,10 +2838,16 @@ class System(Entity):
         process = self.processes.get(process_id)
         if process is None:
             raise KeyError("El Process no pertenece a este System.")
+        if not np.isfinite(now):
+            raise ValueError("now debe ser un tiempo de simulación finito.")
+        self._simulation_time = float(now)
         return process.execute(trigger_id, token_id=token_id, now=now)
 
     def trigger_processes(self, kind: ProcessTriggerKind, processor_id: Optional[UUID] = None, 
     token_id: Optional[UUID] = None, now: float = 0.0,) -> int:
+        if not np.isfinite(now):
+            raise ValueError("now debe ser un tiempo de simulación finito.")
+        self._simulation_time = float(now)
         executed = 0
 
         for process in tuple(self.processes.values()):
@@ -2379,6 +2862,24 @@ class System(Entity):
                         raise ValueError("TOKEN_RECEIVED requiere token_id.")
                 if kind is ProcessTriggerKind.INTERVAL:
                     continue
+                if kind is ProcessTriggerKind.CALENDAR:
+                    continue
+                if kind is ProcessTriggerKind.CONDITION:
+                    if trigger.condition_id is None:
+                        raise ValueError("CONDITION requiere condition_id.")
+                    condition = self.systemic_space.get(trigger.condition_id)
+                    if not isinstance(condition, ProcessCondition):
+                        raise TypeError("condition_id debe referir a ProcessCondition.")
+                    active = condition.evaluate(
+                        self,
+                        None,
+                        now,
+                    )
+                    edge_key = (process.identificator.id, trigger_id)
+                    previous = self._condition_edges.get(edge_key, False)
+                    self._condition_edges[edge_key] = active
+                    if not active or previous:
+                        continue
                 if process.execute(trigger_id, token_id=token_id, now=now):
                     executed += 1
         return executed
@@ -2389,18 +2890,45 @@ class System(Entity):
             now=now,
         )
 
-    def run_simpy(self, until: float, environment: Optional[sim.Environment] = None,) -> sim.Environment:
+    def run_simpy(
+        self,
+        until: float,
+        environment: Optional[sim.Environment] = None,
+        calendar_origin: Optional[datetime] = None,
+        condition_interval: float = 1.0,
+    ) -> sim.Environment:
         if not np.isfinite(until) or until <= 0:
             raise ValueError("until debe ser un tiempo finito mayor que cero.")
+        if not np.isfinite(condition_interval) or condition_interval <= 0:
+            raise ValueError("condition_interval debe ser finito y positivo.")
         if environment is None:
             environment = sim.Environment()
+        requested_clock = (
+            SimulationClock(calendar_origin)
+            if calendar_origin is not None
+            else None
+        )
+        if until <= environment.now:
+            raise ValueError("until debe ser mayor que el tiempo actual de SimPy.")
+        if calendar_origin is not None:
+            if (
+                self._calendar_clock is not None
+                and requested_clock is not None
+                and self._calendar_clock.origin != requested_clock.origin
+            ):
+                raise ValueError("calendar_origin no puede cambiar durante la simulación.")
         if environment is not self._simpy_environment:
             self._simpy_environment = environment
             self._simpy_scheduled.clear()
-        if until <= environment.now:
-            raise ValueError("until debe ser mayor que el tiempo actual de SimPy.")
+            self._condition_edges.clear()
+            self._condition_poll_scheduled = False
+            self._condition_poll_interval = None
+        if requested_clock is not None:
+            self._calendar_clock = requested_clock
 
-        scheduled: list[tuple[Process, UUID, float, float]] = []
+        scheduled_intervals: list[tuple[Process, UUID, float, float]] = []
+        scheduled_calendar: list[tuple[Process, UUID, float]] = []
+        has_condition_triggers = False
         for process in self.processes.values():
             for trigger_id in process.trigger_ids:
                 if (process.identificator.id, trigger_id) in self._simpy_scheduled:
@@ -2414,9 +2942,40 @@ class System(Entity):
                         if trigger.initial_delay is None
                         else trigger.initial_delay
                     )
-                    scheduled.append(
+                    scheduled_intervals.append(
                         (process, trigger_id, trigger.interval, initial_delay)
                     )
+                elif (
+                    isinstance(trigger, ProcessTrigger)
+                    and trigger.kind is ProcessTriggerKind.CALENDAR
+                ):
+                    if trigger.scheduled_at is None:
+                        raise ValueError("Un trigger CALENDAR requiere scheduled_at.")
+                    if self._calendar_clock is None:
+                        raise ValueError(
+                            "CALENDAR requiere calendar_origin al iniciar la simulación."
+                        )
+                    scheduled_time = self._calendar_clock.to_simulation_time(
+                        trigger.scheduled_at
+                    )
+                    if scheduled_time < environment.now:
+                        raise ValueError("El evento CALENDAR está en el pasado.")
+                    scheduled_calendar.append(
+                        (process, trigger_id, scheduled_time - environment.now)
+                    )
+                elif (
+                    isinstance(trigger, ProcessTrigger)
+                    and trigger.kind is ProcessTriggerKind.CONDITION
+                ):
+                    has_condition_triggers = True
+        if (
+            has_condition_triggers
+            and self._condition_poll_scheduled
+            and self._condition_poll_interval != float(condition_interval)
+        ):
+            raise ValueError(
+                "condition_interval no puede cambiar durante una simulación."
+            )
 
         def repeat(process: Process, trigger_id: UUID, interval: float, initial_delay: float,) -> Any:
             yield environment.timeout(initial_delay)
@@ -2424,12 +2983,39 @@ class System(Entity):
                 process.execute(trigger_id, now=environment.now)
                 yield environment.timeout(interval)
 
-        for process, trigger_id, interval, initial_delay in scheduled:
+        for process, trigger_id, interval, initial_delay in scheduled_intervals:
             environment.process(
                 repeat(process, trigger_id, interval, initial_delay)
             )
             self._simpy_scheduled.add((process.identificator.id, trigger_id))
+        for process, trigger_id, delay in scheduled_calendar:
+            def at_calendar_time(
+                scheduled_process: Process,
+                scheduled_trigger_id: UUID,
+                scheduled_delay: float,
+            ) -> Any:
+                yield environment.timeout(scheduled_delay)
+                scheduled_process.execute(
+                    scheduled_trigger_id,
+                    now=environment.now,
+                )
+
+            environment.process(
+                at_calendar_time(process, trigger_id, delay)
+            )
+            self._simpy_scheduled.add((process.identificator.id, trigger_id))
+        if has_condition_triggers and not self._condition_poll_scheduled:
+            self._condition_poll_interval = float(condition_interval)
+
+            def poll_conditions() -> Any:
+                while True:
+                    self.run_condition_processes(now=environment.now)
+                    yield environment.timeout(condition_interval)
+
+            environment.process(poll_conditions())
+            self._condition_poll_scheduled = True
         environment.run(until=until)
+        self._simulation_time = float(environment.now)
         return environment
     
 # ==========================
@@ -2503,6 +3089,7 @@ class Source:
                 f"{entity_type.__name__}."
             ) from None    
 
+# WITHOUT IMPLEMENTATION
 class FlatSpaceTopology:
 
     graph : nx.MultiDiGraph
@@ -2540,7 +3127,8 @@ class FlatSpaceTopology:
 
     def suscribe_system_components(self):
         pass
- 
+
+# WITHOUT IMPLEMENTATION 
 class SpaceMainTopology:
 
     def __init__(self, systemic_space : SystemicSpace) -> None:
@@ -2675,8 +3263,29 @@ if __name__ == "__main__":
     spark_plug_4 = Component(systemic_space)
     combustion_4 = Component(systemic_space)
 
-    crank_angle = VariableElement(systemic_space, "crank_angle", 0.0, ValueConstraints(0, 720))
+    crank_angle = VariableElement(systemic_space, "crank_angle", 0.0, ValueConstraints(0))
     crankshaft.system_state.add_element(crank_angle.identificator.id)
+    crank_velocity = VariableElement(
+        systemic_space,
+        "crank_velocity_deg_s",
+        0.0,
+        ValueConstraints(0, 12000),
+    )
+    crankshaft.system_state.add_element(crank_velocity.identificator.id)
+    engine_cycles = VariableElement(
+        systemic_space,
+        "engine_cycles",
+        0.0,
+        ValueConstraints(0),
+    )
+    crankshaft.system_state.add_element(engine_cycles.identificator.id)
+    engine_phase = DiscreteStateElement(
+        systemic_space,
+        "engine_phase",
+        initial_value="stopped",
+        allowed_values=("stopped", "intake", "compression", "power", "exhaust"),
+    )
+    crankshaft.system_state.add_element(engine_phase.identificator.id)
     cam_angle = VariableElement(systemic_space, "cam_angle", 0.0, ValueConstraints(0, 360))
     camshaft.system_state.add_element(cam_angle.identificator.id)
 
@@ -3300,11 +3909,27 @@ if __name__ == "__main__":
     engine.semantics.add_base_dimension("length")
     engine.semantics.add_base_dimension("angle")
     engine.semantics.add_base_dimension("pressure")
+    engine.semantics.add_base_dimension("time")
     meter_unit = engine.semantics.define_unit("meter", "m", {"length": 1})
     degree_unit = engine.semantics.define_unit("degree", "deg", {"angle": 1})
+    degree_per_second_unit = engine.semantics.define_unit(
+        "degree per second",
+        "deg/s",
+        {"angle": 1, "time": -1},
+    )
     bar_unit = engine.semantics.define_unit("bar", "bar", {"pressure": 1})
     fraction_unit = engine.semantics.define_unit("fraction", "1", {})
     engine.semantics.bind_state_variable(crankshaft.system_state, crank_angle.identificator.id, degree_unit.id)
+    engine.semantics.bind_state_variable(
+        crankshaft.system_state,
+        crank_velocity.identificator.id,
+        degree_per_second_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        crankshaft.system_state,
+        engine_cycles.identificator.id,
+        fraction_unit.id,
+    )
     engine.semantics.bind_state_variable(camshaft.system_state, cam_angle.identificator.id, degree_unit.id)
     engine.semantics.bind_state_variable(cylinder_1.system_state, cylinder_1_phase.identificator.id, degree_unit.id)
     engine.semantics.bind_state_variable(piston_1.system_state, piston_1_position.identificator.id, meter_unit.id)
@@ -3370,270 +3995,272 @@ if __name__ == "__main__":
         },
     )
 
-    simulation_time = ProcessValueRef(
-        systemic_space, ProcessValueScope.SIMULATION_TIME,
-    )
-    time_value = ProcessExpression(
-        systemic_space, ProcessExpressionOperator.READ,
-        value_ref_id=simulation_time.identificator.id,
-    )
-    crank_velocity = ProcessExpression(
-        systemic_space, ProcessExpressionOperator.CONSTANT, value=7200,
-    )
-    current_crank_angle = ProcessExpression(
-        systemic_space, ProcessExpressionOperator.MULTIPLY,
-        operands=(time_value.identificator.id, crank_velocity.identificator.id),
-    )
+    engine_sampling_interval = 0.0025
     crank_interval = ProcessTrigger(
         systemic_space, ProcessTriggerKind.INTERVAL,
-        interval=0.025, initial_delay=0,
+        interval=engine_sampling_interval, initial_delay=0,
     )
     engine_process = Process(
         systemic_space, engine.identificator.id, label="L4 OHV cycle",
-    )
-    set_crank_angle = ProcessAction(
-        systemic_space, ProcessActionKind.SET_COMPONENT_VALUE,
-        expression_id=current_crank_angle.identificator.id,
-        element_id=crank_angle.identificator.id,
-        component_id=crankshaft.identificator.id,
     )
     propagate_couplings = ProcessAction(
         systemic_space, ProcessActionKind.PROPAGATE_STATE_COUPLINGS,
         structure_id=coupling.identificator.id,
     )
     engine_process.add_trigger(crank_interval.identificator.id)
-    engine_process.add_action(set_crank_angle.identificator.id)
     engine_process.add_action(propagate_couplings.identificator.id)
     engine.suscribe_systemic_description(engine_process.identificator.id)
 
+    engine_start = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+    starter_trigger = ProcessTrigger(
+        systemic_space,
+        ProcessTriggerKind.CALENDAR,
+        scheduled_at=engine_start,
+    )
+    starter_speed = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.CONSTANT,
+        value=7200,
+    )
+    start_crankshaft = ProcessAction(
+        systemic_space,
+        ProcessActionKind.SET_STATE_VALUE,
+        expression_id=starter_speed.identificator.id,
+        state_id=crankshaft.system_state.identificator.id,
+        element_id=crank_velocity.identificator.id,
+    )
+    starter_process = Process(
+        systemic_space,
+        engine.identificator.id,
+        label="Calendar starter",
+    )
+    starter_process.add_trigger(starter_trigger.identificator.id)
+    starter_process.add_action(start_crankshaft.identificator.id)
+    engine.suscribe_systemic_description(starter_process.identificator.id)
+
+    crank_angle_ref = ProcessValueRef(
+        systemic_space,
+        ProcessValueScope.SYSTEM_STATE,
+        element_id=crank_angle.identificator.id,
+        state_id=crankshaft.system_state.identificator.id,
+    )
+    crank_angle_value = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.READ,
+        value_ref_id=crank_angle_ref.identificator.id,
+    )
+    # Tolerance keeps the sampled cycle condition robust against ODE roundoff.
+    cycle_limit = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.CONSTANT,
+        value=720 - 1e-6,
+    )
+    cycle_complete = ProcessCondition(
+        systemic_space,
+        ProcessConditionOperator.GREATER_EQUAL,
+        (crank_angle_value.identificator.id, cycle_limit.identificator.id),
+    )
+    cycle_trigger = ProcessTrigger(
+        systemic_space,
+        ProcessTriggerKind.CONDITION,
+        condition_id=cycle_complete.identificator.id,
+    )
+    reset_angle = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.CONSTANT,
+        value=0,
+    )
+    cycle_count_ref = ProcessValueRef(
+        systemic_space,
+        ProcessValueScope.SYSTEM_STATE,
+        element_id=engine_cycles.identificator.id,
+        state_id=crankshaft.system_state.identificator.id,
+    )
+    cycle_count_value = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.READ,
+        value_ref_id=cycle_count_ref.identificator.id,
+    )
+    one_cycle = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.CONSTANT,
+        value=1,
+    )
+    next_cycle_count = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.ADD,
+        operands=(cycle_count_value.identificator.id, one_cycle.identificator.id),
+    )
+    reset_crank_angle = ProcessAction(
+        systemic_space,
+        ProcessActionKind.SET_STATE_VALUE,
+        expression_id=reset_angle.identificator.id,
+        state_id=crankshaft.system_state.identificator.id,
+        element_id=crank_angle.identificator.id,
+    )
+    increment_cycle_count = ProcessAction(
+        systemic_space,
+        ProcessActionKind.SET_STATE_VALUE,
+        expression_id=next_cycle_count.identificator.id,
+        state_id=crankshaft.system_state.identificator.id,
+        element_id=engine_cycles.identificator.id,
+    )
+    cycle_process = Process(
+        systemic_space,
+        engine.identificator.id,
+        label="Four-stroke cycle boundary",
+    )
+    cycle_process.add_trigger(cycle_trigger.identificator.id)
+    cycle_process.add_action(reset_crank_angle.identificator.id)
+    cycle_process.add_action(increment_cycle_count.identificator.id)
+    cycle_process.add_action(propagate_couplings.identificator.id)
+    engine.suscribe_systemic_description(cycle_process.identificator.id)
+
+    coupling.propagate()
+    engine_history = engine.enable_history()
     simulation = sim.Environment()
-    simulation = engine.run_simpy(until=0.0001, environment=simulation)
-    print("advance 1/5")
-    print("crank_angle", crankshaft.system_state.read_value(crank_angle.identificator.id))
-    print("cam_angle", camshaft.system_state.read_value(cam_angle.identificator.id))
-    print("cylinder_1_phase", cylinder_1.system_state.read_value(cylinder_1_phase.identificator.id))
-    print("piston_1_position", piston_1.system_state.read_value(piston_1_position.identificator.id))
-    print("pushrod_1_intake", pushrod_1.system_state.read_value(pushrod_1_intake.identificator.id))
-    print("pushrod_1_exhaust", pushrod_1.system_state.read_value(pushrod_1_exhaust.identificator.id))
-    print("rocker_1_intake", rocker_1.system_state.read_value(rocker_1_intake.identificator.id))
-    print("rocker_1_exhaust", rocker_1.system_state.read_value(rocker_1_exhaust.identificator.id))
-    print("valve_1_intake", valves_1.system_state.read_value(valve_1_intake.identificator.id))
-    print("valve_1_exhaust", valves_1.system_state.read_value(valve_1_exhaust.identificator.id))
-    print("spark_1", spark_plug_1.system_state.read_value(spark_1.identificator.id))
-    print("pressure_1", combustion_1.system_state.read_value(pressure_1.identificator.id))
-    print("cylinder_2_phase", cylinder_2.system_state.read_value(cylinder_2_phase.identificator.id))
-    print("piston_2_position", piston_2.system_state.read_value(piston_2_position.identificator.id))
-    print("pushrod_2_intake", pushrod_2.system_state.read_value(pushrod_2_intake.identificator.id))
-    print("pushrod_2_exhaust", pushrod_2.system_state.read_value(pushrod_2_exhaust.identificator.id))
-    print("rocker_2_intake", rocker_2.system_state.read_value(rocker_2_intake.identificator.id))
-    print("rocker_2_exhaust", rocker_2.system_state.read_value(rocker_2_exhaust.identificator.id))
-    print("valve_2_intake", valves_2.system_state.read_value(valve_2_intake.identificator.id))
-    print("valve_2_exhaust", valves_2.system_state.read_value(valve_2_exhaust.identificator.id))
-    print("spark_2", spark_plug_2.system_state.read_value(spark_2.identificator.id))
-    print("pressure_2", combustion_2.system_state.read_value(pressure_2.identificator.id))
-    print("cylinder_3_phase", cylinder_3.system_state.read_value(cylinder_3_phase.identificator.id))
-    print("piston_3_position", piston_3.system_state.read_value(piston_3_position.identificator.id))
-    print("pushrod_3_intake", pushrod_3.system_state.read_value(pushrod_3_intake.identificator.id))
-    print("pushrod_3_exhaust", pushrod_3.system_state.read_value(pushrod_3_exhaust.identificator.id))
-    print("rocker_3_intake", rocker_3.system_state.read_value(rocker_3_intake.identificator.id))
-    print("rocker_3_exhaust", rocker_3.system_state.read_value(rocker_3_exhaust.identificator.id))
-    print("valve_3_intake", valves_3.system_state.read_value(valve_3_intake.identificator.id))
-    print("valve_3_exhaust", valves_3.system_state.read_value(valve_3_exhaust.identificator.id))
-    print("spark_3", spark_plug_3.system_state.read_value(spark_3.identificator.id))
-    print("pressure_3", combustion_3.system_state.read_value(pressure_3.identificator.id))
-    print("cylinder_4_phase", cylinder_4.system_state.read_value(cylinder_4_phase.identificator.id))
-    print("piston_4_position", piston_4.system_state.read_value(piston_4_position.identificator.id))
-    print("pushrod_4_intake", pushrod_4.system_state.read_value(pushrod_4_intake.identificator.id))
-    print("pushrod_4_exhaust", pushrod_4.system_state.read_value(pushrod_4_exhaust.identificator.id))
-    print("rocker_4_intake", rocker_4.system_state.read_value(rocker_4_intake.identificator.id))
-    print("rocker_4_exhaust", rocker_4.system_state.read_value(rocker_4_exhaust.identificator.id))
-    print("valve_4_intake", valves_4.system_state.read_value(valve_4_intake.identificator.id))
-    print("valve_4_exhaust", valves_4.system_state.read_value(valve_4_exhaust.identificator.id))
-    print("spark_4", spark_plug_4.system_state.read_value(spark_4.identificator.id))
-    print("pressure_4", combustion_4.system_state.read_value(pressure_4.identificator.id))
-    simulation = engine.run_simpy(until=0.0251, environment=simulation)
-    print("advance 2/5")
-    print("crank_angle", crankshaft.system_state.read_value(crank_angle.identificator.id))
-    print("cam_angle", camshaft.system_state.read_value(cam_angle.identificator.id))
-    print("cylinder_1_phase", cylinder_1.system_state.read_value(cylinder_1_phase.identificator.id))
-    print("piston_1_position", piston_1.system_state.read_value(piston_1_position.identificator.id))
-    print("pushrod_1_intake", pushrod_1.system_state.read_value(pushrod_1_intake.identificator.id))
-    print("pushrod_1_exhaust", pushrod_1.system_state.read_value(pushrod_1_exhaust.identificator.id))
-    print("rocker_1_intake", rocker_1.system_state.read_value(rocker_1_intake.identificator.id))
-    print("rocker_1_exhaust", rocker_1.system_state.read_value(rocker_1_exhaust.identificator.id))
-    print("valve_1_intake", valves_1.system_state.read_value(valve_1_intake.identificator.id))
-    print("valve_1_exhaust", valves_1.system_state.read_value(valve_1_exhaust.identificator.id))
-    print("spark_1", spark_plug_1.system_state.read_value(spark_1.identificator.id))
-    print("pressure_1", combustion_1.system_state.read_value(pressure_1.identificator.id))
-    print("cylinder_2_phase", cylinder_2.system_state.read_value(cylinder_2_phase.identificator.id))
-    print("piston_2_position", piston_2.system_state.read_value(piston_2_position.identificator.id))
-    print("pushrod_2_intake", pushrod_2.system_state.read_value(pushrod_2_intake.identificator.id))
-    print("pushrod_2_exhaust", pushrod_2.system_state.read_value(pushrod_2_exhaust.identificator.id))
-    print("rocker_2_intake", rocker_2.system_state.read_value(rocker_2_intake.identificator.id))
-    print("rocker_2_exhaust", rocker_2.system_state.read_value(rocker_2_exhaust.identificator.id))
-    print("valve_2_intake", valves_2.system_state.read_value(valve_2_intake.identificator.id))
-    print("valve_2_exhaust", valves_2.system_state.read_value(valve_2_exhaust.identificator.id))
-    print("spark_2", spark_plug_2.system_state.read_value(spark_2.identificator.id))
-    print("pressure_2", combustion_2.system_state.read_value(pressure_2.identificator.id))
-    print("cylinder_3_phase", cylinder_3.system_state.read_value(cylinder_3_phase.identificator.id))
-    print("piston_3_position", piston_3.system_state.read_value(piston_3_position.identificator.id))
-    print("pushrod_3_intake", pushrod_3.system_state.read_value(pushrod_3_intake.identificator.id))
-    print("pushrod_3_exhaust", pushrod_3.system_state.read_value(pushrod_3_exhaust.identificator.id))
-    print("rocker_3_intake", rocker_3.system_state.read_value(rocker_3_intake.identificator.id))
-    print("rocker_3_exhaust", rocker_3.system_state.read_value(rocker_3_exhaust.identificator.id))
-    print("valve_3_intake", valves_3.system_state.read_value(valve_3_intake.identificator.id))
-    print("valve_3_exhaust", valves_3.system_state.read_value(valve_3_exhaust.identificator.id))
-    print("spark_3", spark_plug_3.system_state.read_value(spark_3.identificator.id))
-    print("pressure_3", combustion_3.system_state.read_value(pressure_3.identificator.id))
-    print("cylinder_4_phase", cylinder_4.system_state.read_value(cylinder_4_phase.identificator.id))
-    print("piston_4_position", piston_4.system_state.read_value(piston_4_position.identificator.id))
-    print("pushrod_4_intake", pushrod_4.system_state.read_value(pushrod_4_intake.identificator.id))
-    print("pushrod_4_exhaust", pushrod_4.system_state.read_value(pushrod_4_exhaust.identificator.id))
-    print("rocker_4_intake", rocker_4.system_state.read_value(rocker_4_intake.identificator.id))
-    print("rocker_4_exhaust", rocker_4.system_state.read_value(rocker_4_exhaust.identificator.id))
-    print("valve_4_intake", valves_4.system_state.read_value(valve_4_intake.identificator.id))
-    print("valve_4_exhaust", valves_4.system_state.read_value(valve_4_exhaust.identificator.id))
-    print("spark_4", spark_plug_4.system_state.read_value(spark_4.identificator.id))
-    print("pressure_4", combustion_4.system_state.read_value(pressure_4.identificator.id))
-    simulation = engine.run_simpy(until=0.0501, environment=simulation)
-    print("advance 3/5")
-    print("crank_angle", crankshaft.system_state.read_value(crank_angle.identificator.id))
-    print("cam_angle", camshaft.system_state.read_value(cam_angle.identificator.id))
-    print("cylinder_1_phase", cylinder_1.system_state.read_value(cylinder_1_phase.identificator.id))
-    print("piston_1_position", piston_1.system_state.read_value(piston_1_position.identificator.id))
-    print("pushrod_1_intake", pushrod_1.system_state.read_value(pushrod_1_intake.identificator.id))
-    print("pushrod_1_exhaust", pushrod_1.system_state.read_value(pushrod_1_exhaust.identificator.id))
-    print("rocker_1_intake", rocker_1.system_state.read_value(rocker_1_intake.identificator.id))
-    print("rocker_1_exhaust", rocker_1.system_state.read_value(rocker_1_exhaust.identificator.id))
-    print("valve_1_intake", valves_1.system_state.read_value(valve_1_intake.identificator.id))
-    print("valve_1_exhaust", valves_1.system_state.read_value(valve_1_exhaust.identificator.id))
-    print("spark_1", spark_plug_1.system_state.read_value(spark_1.identificator.id))
-    print("pressure_1", combustion_1.system_state.read_value(pressure_1.identificator.id))
-    print("cylinder_2_phase", cylinder_2.system_state.read_value(cylinder_2_phase.identificator.id))
-    print("piston_2_position", piston_2.system_state.read_value(piston_2_position.identificator.id))
-    print("pushrod_2_intake", pushrod_2.system_state.read_value(pushrod_2_intake.identificator.id))
-    print("pushrod_2_exhaust", pushrod_2.system_state.read_value(pushrod_2_exhaust.identificator.id))
-    print("rocker_2_intake", rocker_2.system_state.read_value(rocker_2_intake.identificator.id))
-    print("rocker_2_exhaust", rocker_2.system_state.read_value(rocker_2_exhaust.identificator.id))
-    print("valve_2_intake", valves_2.system_state.read_value(valve_2_intake.identificator.id))
-    print("valve_2_exhaust", valves_2.system_state.read_value(valve_2_exhaust.identificator.id))
-    print("spark_2", spark_plug_2.system_state.read_value(spark_2.identificator.id))
-    print("pressure_2", combustion_2.system_state.read_value(pressure_2.identificator.id))
-    print("cylinder_3_phase", cylinder_3.system_state.read_value(cylinder_3_phase.identificator.id))
-    print("piston_3_position", piston_3.system_state.read_value(piston_3_position.identificator.id))
-    print("pushrod_3_intake", pushrod_3.system_state.read_value(pushrod_3_intake.identificator.id))
-    print("pushrod_3_exhaust", pushrod_3.system_state.read_value(pushrod_3_exhaust.identificator.id))
-    print("rocker_3_intake", rocker_3.system_state.read_value(rocker_3_intake.identificator.id))
-    print("rocker_3_exhaust", rocker_3.system_state.read_value(rocker_3_exhaust.identificator.id))
-    print("valve_3_intake", valves_3.system_state.read_value(valve_3_intake.identificator.id))
-    print("valve_3_exhaust", valves_3.system_state.read_value(valve_3_exhaust.identificator.id))
-    print("spark_3", spark_plug_3.system_state.read_value(spark_3.identificator.id))
-    print("pressure_3", combustion_3.system_state.read_value(pressure_3.identificator.id))
-    print("cylinder_4_phase", cylinder_4.system_state.read_value(cylinder_4_phase.identificator.id))
-    print("piston_4_position", piston_4.system_state.read_value(piston_4_position.identificator.id))
-    print("pushrod_4_intake", pushrod_4.system_state.read_value(pushrod_4_intake.identificator.id))
-    print("pushrod_4_exhaust", pushrod_4.system_state.read_value(pushrod_4_exhaust.identificator.id))
-    print("rocker_4_intake", rocker_4.system_state.read_value(rocker_4_intake.identificator.id))
-    print("rocker_4_exhaust", rocker_4.system_state.read_value(rocker_4_exhaust.identificator.id))
-    print("valve_4_intake", valves_4.system_state.read_value(valve_4_intake.identificator.id))
-    print("valve_4_exhaust", valves_4.system_state.read_value(valve_4_exhaust.identificator.id))
-    print("spark_4", spark_plug_4.system_state.read_value(spark_4.identificator.id))
-    print("pressure_4", combustion_4.system_state.read_value(pressure_4.identificator.id))
-    simulation = engine.run_simpy(until=0.0751, environment=simulation)
-    print("advance 4/5")
-    print("crank_angle", crankshaft.system_state.read_value(crank_angle.identificator.id))
-    print("cam_angle", camshaft.system_state.read_value(cam_angle.identificator.id))
-    print("cylinder_1_phase", cylinder_1.system_state.read_value(cylinder_1_phase.identificator.id))
-    print("piston_1_position", piston_1.system_state.read_value(piston_1_position.identificator.id))
-    print("pushrod_1_intake", pushrod_1.system_state.read_value(pushrod_1_intake.identificator.id))
-    print("pushrod_1_exhaust", pushrod_1.system_state.read_value(pushrod_1_exhaust.identificator.id))
-    print("rocker_1_intake", rocker_1.system_state.read_value(rocker_1_intake.identificator.id))
-    print("rocker_1_exhaust", rocker_1.system_state.read_value(rocker_1_exhaust.identificator.id))
-    print("valve_1_intake", valves_1.system_state.read_value(valve_1_intake.identificator.id))
-    print("valve_1_exhaust", valves_1.system_state.read_value(valve_1_exhaust.identificator.id))
-    print("spark_1", spark_plug_1.system_state.read_value(spark_1.identificator.id))
-    print("pressure_1", combustion_1.system_state.read_value(pressure_1.identificator.id))
-    print("cylinder_2_phase", cylinder_2.system_state.read_value(cylinder_2_phase.identificator.id))
-    print("piston_2_position", piston_2.system_state.read_value(piston_2_position.identificator.id))
-    print("pushrod_2_intake", pushrod_2.system_state.read_value(pushrod_2_intake.identificator.id))
-    print("pushrod_2_exhaust", pushrod_2.system_state.read_value(pushrod_2_exhaust.identificator.id))
-    print("rocker_2_intake", rocker_2.system_state.read_value(rocker_2_intake.identificator.id))
-    print("rocker_2_exhaust", rocker_2.system_state.read_value(rocker_2_exhaust.identificator.id))
-    print("valve_2_intake", valves_2.system_state.read_value(valve_2_intake.identificator.id))
-    print("valve_2_exhaust", valves_2.system_state.read_value(valve_2_exhaust.identificator.id))
-    print("spark_2", spark_plug_2.system_state.read_value(spark_2.identificator.id))
-    print("pressure_2", combustion_2.system_state.read_value(pressure_2.identificator.id))
-    print("cylinder_3_phase", cylinder_3.system_state.read_value(cylinder_3_phase.identificator.id))
-    print("piston_3_position", piston_3.system_state.read_value(piston_3_position.identificator.id))
-    print("pushrod_3_intake", pushrod_3.system_state.read_value(pushrod_3_intake.identificator.id))
-    print("pushrod_3_exhaust", pushrod_3.system_state.read_value(pushrod_3_exhaust.identificator.id))
-    print("rocker_3_intake", rocker_3.system_state.read_value(rocker_3_intake.identificator.id))
-    print("rocker_3_exhaust", rocker_3.system_state.read_value(rocker_3_exhaust.identificator.id))
-    print("valve_3_intake", valves_3.system_state.read_value(valve_3_intake.identificator.id))
-    print("valve_3_exhaust", valves_3.system_state.read_value(valve_3_exhaust.identificator.id))
-    print("spark_3", spark_plug_3.system_state.read_value(spark_3.identificator.id))
-    print("pressure_3", combustion_3.system_state.read_value(pressure_3.identificator.id))
-    print("cylinder_4_phase", cylinder_4.system_state.read_value(cylinder_4_phase.identificator.id))
-    print("piston_4_position", piston_4.system_state.read_value(piston_4_position.identificator.id))
-    print("pushrod_4_intake", pushrod_4.system_state.read_value(pushrod_4_intake.identificator.id))
-    print("pushrod_4_exhaust", pushrod_4.system_state.read_value(pushrod_4_exhaust.identificator.id))
-    print("rocker_4_intake", rocker_4.system_state.read_value(rocker_4_intake.identificator.id))
-    print("rocker_4_exhaust", rocker_4.system_state.read_value(rocker_4_exhaust.identificator.id))
-    print("valve_4_intake", valves_4.system_state.read_value(valve_4_intake.identificator.id))
-    print("valve_4_exhaust", valves_4.system_state.read_value(valve_4_exhaust.identificator.id))
-    print("spark_4", spark_plug_4.system_state.read_value(spark_4.identificator.id))
-    print("pressure_4", combustion_4.system_state.read_value(pressure_4.identificator.id))
-    simulation = engine.run_simpy(until=0.1001, environment=simulation)
-    print("advance 5/5")
-    print("crank_angle", crankshaft.system_state.read_value(crank_angle.identificator.id))
-    print("cam_angle", camshaft.system_state.read_value(cam_angle.identificator.id))
-    print("cylinder_1_phase", cylinder_1.system_state.read_value(cylinder_1_phase.identificator.id))
-    print("piston_1_position", piston_1.system_state.read_value(piston_1_position.identificator.id))
-    print("pushrod_1_intake", pushrod_1.system_state.read_value(pushrod_1_intake.identificator.id))
-    print("pushrod_1_exhaust", pushrod_1.system_state.read_value(pushrod_1_exhaust.identificator.id))
-    print("rocker_1_intake", rocker_1.system_state.read_value(rocker_1_intake.identificator.id))
-    print("rocker_1_exhaust", rocker_1.system_state.read_value(rocker_1_exhaust.identificator.id))
-    print("valve_1_intake", valves_1.system_state.read_value(valve_1_intake.identificator.id))
-    print("valve_1_exhaust", valves_1.system_state.read_value(valve_1_exhaust.identificator.id))
-    print("spark_1", spark_plug_1.system_state.read_value(spark_1.identificator.id))
-    print("pressure_1", combustion_1.system_state.read_value(pressure_1.identificator.id))
-    print("cylinder_2_phase", cylinder_2.system_state.read_value(cylinder_2_phase.identificator.id))
-    print("piston_2_position", piston_2.system_state.read_value(piston_2_position.identificator.id))
-    print("pushrod_2_intake", pushrod_2.system_state.read_value(pushrod_2_intake.identificator.id))
-    print("pushrod_2_exhaust", pushrod_2.system_state.read_value(pushrod_2_exhaust.identificator.id))
-    print("rocker_2_intake", rocker_2.system_state.read_value(rocker_2_intake.identificator.id))
-    print("rocker_2_exhaust", rocker_2.system_state.read_value(rocker_2_exhaust.identificator.id))
-    print("valve_2_intake", valves_2.system_state.read_value(valve_2_intake.identificator.id))
-    print("valve_2_exhaust", valves_2.system_state.read_value(valve_2_exhaust.identificator.id))
-    print("spark_2", spark_plug_2.system_state.read_value(spark_2.identificator.id))
-    print("pressure_2", combustion_2.system_state.read_value(pressure_2.identificator.id))
-    print("cylinder_3_phase", cylinder_3.system_state.read_value(cylinder_3_phase.identificator.id))
-    print("piston_3_position", piston_3.system_state.read_value(piston_3_position.identificator.id))
-    print("pushrod_3_intake", pushrod_3.system_state.read_value(pushrod_3_intake.identificator.id))
-    print("pushrod_3_exhaust", pushrod_3.system_state.read_value(pushrod_3_exhaust.identificator.id))
-    print("rocker_3_intake", rocker_3.system_state.read_value(rocker_3_intake.identificator.id))
-    print("rocker_3_exhaust", rocker_3.system_state.read_value(rocker_3_exhaust.identificator.id))
-    print("valve_3_intake", valves_3.system_state.read_value(valve_3_intake.identificator.id))
-    print("valve_3_exhaust", valves_3.system_state.read_value(valve_3_exhaust.identificator.id))
-    print("spark_3", spark_plug_3.system_state.read_value(spark_3.identificator.id))
-    print("pressure_3", combustion_3.system_state.read_value(pressure_3.identificator.id))
-    print("cylinder_4_phase", cylinder_4.system_state.read_value(cylinder_4_phase.identificator.id))
-    print("piston_4_position", piston_4.system_state.read_value(piston_4_position.identificator.id))
-    print("pushrod_4_intake", pushrod_4.system_state.read_value(pushrod_4_intake.identificator.id))
-    print("pushrod_4_exhaust", pushrod_4.system_state.read_value(pushrod_4_exhaust.identificator.id))
-    print("rocker_4_intake", rocker_4.system_state.read_value(rocker_4_intake.identificator.id))
-    print("rocker_4_exhaust", rocker_4.system_state.read_value(rocker_4_exhaust.identificator.id))
-    print("valve_4_intake", valves_4.system_state.read_value(valve_4_intake.identificator.id))
-    print("valve_4_exhaust", valves_4.system_state.read_value(valve_4_exhaust.identificator.id))
-    print("spark_4", spark_plug_4.system_state.read_value(spark_4.identificator.id))
-    print("pressure_4", combustion_4.system_state.read_value(pressure_4.identificator.id))
-    
-    plt.figure(figsize = (6,4))
-    nx.draw(G = coupling.topology, 
-    node_color = "black",  
-    with_labels=False,
-    node_size=800,
-    font_size=12,
-    font_weight='bold',
-    edge_color='gray')
+    simulation = engine.run_simpy(
+        until=0.000001,
+        environment=simulation,
+        calendar_origin=engine_start,
+        condition_interval=engine_sampling_interval,
+    )
+    if crankshaft.system_state.read_value(crank_velocity.identificator.id) <= 0:
+        raise RuntimeError("The calendar starter did not activate the crankshaft.")
+    crankshaft.system_state.set_discrete_value(
+        engine_phase.identificator.id,
+        "intake",
+    )
+
+    crank_integrator = ODEIntegrator(
+        crankshaft.system_state,
+        (crank_angle.identificator.id, crank_velocity.identificator.id),
+        lambda _time, values: (values[1], 0.0),
+    )
+    engine_step = engine_sampling_interval
+    print("\nL4 OHV: temporal integration over four cycles")
+    print("t_sim | simulated date | cycle | phase | crank | cam | cylinder 1 pressure")
+    for step in range(1, 161):
+        step_start = (step - 1) * engine_step
+        step_end = step * engine_step
+        crank_trajectory = crank_integrator.integrate(
+            (step_start, step_end),
+            t_eval=(step_start, step_end),
+        )
+        simulation = engine.run_simpy(
+            until=step_end + 0.000001,
+            environment=simulation,
+            condition_interval=engine_sampling_interval,
+        )
+
+        phase_angle = crankshaft.system_state.read_value(crank_angle.identificator.id) % 720
+        if phase_angle < 180:
+            crankshaft.system_state.set_discrete_value(
+                engine_phase.identificator.id,
+                "intake",
+            )
+        elif phase_angle < 360:
+            crankshaft.system_state.set_discrete_value(
+                engine_phase.identificator.id,
+                "compression",
+            )
+        elif phase_angle < 540:
+            crankshaft.system_state.set_discrete_value(
+                engine_phase.identificator.id,
+                "power",
+            )
+        else:
+            crankshaft.system_state.set_discrete_value(
+                engine_phase.identificator.id,
+                "exhaust",
+            )
+
+        simulated_datetime = engine.simulation_datetime
+        if simulated_datetime is None:
+            raise RuntimeError("The calendar clock was not configured.")
+        print(
+            f"{step_end:0.3f}s | {simulated_datetime.isoformat()} | "
+            f"cycle {crankshaft.system_state.read_value(engine_cycles.identificator.id):0.0f} | "
+            f"{crankshaft.system_state.read_discrete_value(engine_phase.identificator.id)} | "
+            f"crank {phase_angle:06.2f} deg | "
+            f"cam {camshaft.system_state.read_value(cam_angle.identificator.id):06.2f} deg | "
+            f"C1 {combustion_1.system_state.read_value(pressure_1.identificator.id):04.2f} bar | "
+            f"cylinders [{cylinder_1.system_state.read_value(cylinder_1_phase.identificator.id):06.2f}, "
+            f"{cylinder_2.system_state.read_value(cylinder_2_phase.identificator.id):06.2f}, "
+            f"{cylinder_3.system_state.read_value(cylinder_3_phase.identificator.id):06.2f}, "
+            f"{cylinder_4.system_state.read_value(cylinder_4_phase.identificator.id):06.2f}] deg | "
+            f"ODE {len(crank_trajectory.times)} samples"
+        )
+
+    final_simulated_datetime = engine.simulation_datetime
+    if final_simulated_datetime is None:
+        raise RuntimeError("The calendar clock was not configured.")
+    print("\nTemporal summary")
+    print(
+        "Completed cycles:",
+        crankshaft.system_state.read_value(engine_cycles.identificator.id),
+    )
+    print("Final simulated date:", final_simulated_datetime.isoformat())
+    print("Trajectory samples:", len(engine_history.samples))
+    print("Discrete phase transitions:", len(engine_history.discrete_events))
+
+    piston_1_trajectory = engine_history.trajectory(
+        piston_1.system_state.identificator.id,
+        piston_1_position.identificator.id,
+    )
+    piston_2_trajectory = engine_history.trajectory(
+        piston_2.system_state.identificator.id,
+        piston_2_position.identificator.id,
+    )
+    piston_3_trajectory = engine_history.trajectory(
+        piston_3.system_state.identificator.id,
+        piston_3_position.identificator.id,
+    )
+    piston_4_trajectory = engine_history.trajectory(
+        piston_4.system_state.identificator.id,
+        piston_4_position.identificator.id,
+    )
+
+    piston_figure, (
+        piston_1_axis,
+        piston_2_axis,
+        piston_3_axis,
+        piston_4_axis,
+    ) = plt.subplots(
+        4,
+        1,
+        sharex=True,
+        num="L4 OHV piston trajectories",
+    )
+    piston_1_axis.plot(
+        piston_1_trajectory.times,
+        piston_1_trajectory.values[piston_1_position.identificator.id],
+    )
+    piston_1_axis.set_ylabel("Position (m)")
+    piston_1_axis.set_title("Piston 1")
+    piston_1_axis.grid(True)
+    piston_2_axis.plot(
+        piston_2_trajectory.times,
+        piston_2_trajectory.values[piston_2_position.identificator.id],
+    )
+    piston_2_axis.set_ylabel("Position (m)")
+    piston_2_axis.set_title("Piston 2")
+    piston_2_axis.grid(True)
+    piston_3_axis.plot(
+        piston_3_trajectory.times,
+        piston_3_trajectory.values[piston_3_position.identificator.id],
+    )
+    piston_3_axis.set_ylabel("Position (m)")
+    piston_3_axis.set_title("Piston 3")
+    piston_3_axis.grid(True)
+    piston_4_axis.plot(
+        piston_4_trajectory.times,
+        piston_4_trajectory.values[piston_4_position.identificator.id],
+    )
+    piston_4_axis.set_ylabel("Position (m)")
+    piston_4_axis.set_title("Piston 4")
+    piston_4_axis.set_xlabel("Simulation time (s)")
+    piston_4_axis.grid(True)
+    piston_figure.suptitle("Piston motion")
+    piston_figure.tight_layout()
     plt.show()
