@@ -166,6 +166,7 @@ class VariableElement(StateElement):
 
 
 DiscreteValue = Union[str, int, bool, Enum]
+StateValue = Union[float, DiscreteValue]
 
 
 class DiscreteStateElement(StateElement):
@@ -395,16 +396,7 @@ class SystemState(Entity):
                 "Solo se puede asignar valor a un DiscreteStateElement de este estado."
             )
         validated_value = entity_element.validate_value(value)
-        entity_element._value = validated_value
-        for history, time_provider in tuple(self._history_recorders):
-            now = time_provider()
-            history.record_discrete(
-                self.identificator.id,
-                element,
-                validated_value,
-                now,
-            )
-            history.record_state(self, now)
+        self._commit_state_updates({element: validated_value})
 
     def read_element(
         self,
@@ -468,9 +460,79 @@ class SystemState(Entity):
             self.evaluate(custom_values = candidate_values)
         return validated_updates
 
+    def validate_state_updates(
+        self,
+        updates: Mapping[UUID, StateValue],
+    ) -> dict[UUID, StateValue]:
+        numeric_updates: dict[UUID, float] = {}
+        discrete_updates: dict[UUID, DiscreteValue] = {}
+        for element_id, value in updates.items():
+            element = self.elements.get(element_id)
+            if isinstance(element, VariableElement):
+                if isinstance(value, (str, bool, Enum)) or not isinstance(
+                    value, (int, float, np.number)
+                ):
+                    raise TypeError("Una VariableElement requiere un valor numérico.")
+                numeric_updates[element_id] = float(value)
+            elif isinstance(element, DiscreteStateElement):
+                if not isinstance(value, (str, int, bool, Enum)):
+                    raise TypeError(
+                        "Un DiscreteStateElement requiere un valor categórico."
+                    )
+                discrete_updates[element_id] = value
+            else:
+                raise KeyError(
+                    "Cada elemento debe pertenecer al estado y ser asignable."
+                )
+        validated: dict[UUID, StateValue] = dict(self.validate_values(numeric_updates))
+        for element_id, value in discrete_updates.items():
+            element = self.elements[element_id]
+            if not isinstance(element, DiscreteStateElement):
+                raise TypeError("El elemento discreto dejó de pertenecer al estado.")
+            validated[element_id] = element.validate_value(value)
+        return validated
+
     def set_values(self, updates: dict[UUID, float]) -> None:
         validated_updates = self.validate_values(updates)
         self._commit_validated_values(validated_updates)
+
+    def _commit_state_updates(
+        self,
+        updates: Mapping[UUID, StateValue],
+        record_history: bool = True,
+    ) -> None:
+        validated_updates = self.validate_state_updates(updates)
+        discrete_updates: dict[UUID, DiscreteValue] = {}
+        numeric_updates: dict[UUID, float] = {}
+        for element_id, value in validated_updates.items():
+            element = self.elements[element_id]
+            if isinstance(element, VariableElement):
+                if not isinstance(value, float):
+                    raise TypeError("Una VariableElement requiere un valor numérico.")
+                numeric_updates[element_id] = value
+            elif isinstance(element, DiscreteStateElement):
+                if not isinstance(value, (str, int, bool, Enum)):
+                    raise TypeError("Un DiscreteStateElement requiere un valor categórico.")
+                discrete_updates[element_id] = value
+            else:
+                raise TypeError("El elemento no es una variable asignable.")
+        self._commit_validated_values(numeric_updates, record_history=False)
+        for element_id, value in discrete_updates.items():
+            element = self.elements[element_id]
+            if not isinstance(element, DiscreteStateElement):
+                raise TypeError("El elemento discreto dejó de pertenecer al estado.")
+            element._value = value
+        if record_history:
+            for history, time_provider in tuple(self._history_recorders):
+                now = time_provider()
+                for element_id, value in discrete_updates.items():
+                    history.record_discrete(
+                        self.identificator.id,
+                        element_id,
+                        value,
+                        now,
+                    )
+                history.record_state(self, now)
 
     def _commit_validated_values(
         self,
@@ -814,28 +876,44 @@ class ODETrajectory:
     values: dict[UUID, np.ndarray]
 
 class ODEIntegrator:
-    """Integrates selected scalar variables; time values and derivatives use seconds."""
+    """Integrate variables across states; derivative-vector order follows variable_ids."""
 
     def __init__(
         self,
-        state: SystemState,
+        state: Union[SystemState, Sequence[SystemState]],
         variable_ids: Sequence[UUID],
         derivatives: Callable[
             [float, np.ndarray],
             Union[Sequence[float], np.ndarray],
         ],
     ) -> None:
-        if not isinstance(state, SystemState):
-            raise TypeError("state debe ser SystemState.")
+        states = (state,) if isinstance(state, SystemState) else tuple(state)
+        if not states or any(not isinstance(candidate, SystemState) for candidate in states):
+            raise TypeError("state debe ser SystemState o una secuencia no vacía de estados.")
+        if len({candidate.identificator.id for candidate in states}) != len(states):
+            raise ValueError("La secuencia de estados no puede contener duplicados.")
+        if any(
+            candidate.systemic_space is not states[0].systemic_space
+            for candidate in states
+        ):
+            raise ValueError("Los estados ODE deben pertenecer al mismo SystemicSpace.")
         variables = tuple(variable_ids)
         if not variables or len(set(variables)) != len(variables):
             raise ValueError("variable_ids debe contener variables únicas y no vacías.")
         if not callable(derivatives):
             raise TypeError("derivatives debe ser invocable.")
+        state_by_element = {
+            element_id: candidate
+            for candidate in states
+            for element_id in candidate.elements
+        }
         for element_id in variables:
-            if not isinstance(state.elements.get(element_id), VariableElement):
-                raise KeyError("Cada variable debe pertenecer al estado indicado.")
-        self.state = state
+            owner = state_by_element.get(element_id)
+            if owner is None or not isinstance(owner.elements.get(element_id), VariableElement):
+                raise KeyError("Cada variable debe pertenecer a uno de los estados indicados.")
+        self.states = states
+        self.state = states[0]
+        self._state_by_element = state_by_element
         self.variable_ids = variables
         self.derivatives = derivatives
 
@@ -874,7 +952,10 @@ class ODEIntegrator:
             evaluation_times = np.append(evaluation_times, end)
 
         initial_values = np.asarray(
-            [self.state.read_value(element_id) for element_id in self.variable_ids],
+            [
+                self._state_by_element[element_id].read_value(element_id)
+                for element_id in self.variable_ids
+            ],
             dtype=float,
         )
 
@@ -902,37 +983,46 @@ class ODEIntegrator:
             for index, element_id in enumerate(self.variable_ids)
         }
         for element_id, values in values_by_id.items():
-            variable = self.state.elements[element_id]
+            variable = self._state_by_element[element_id].elements[element_id]
             if not isinstance(variable, VariableElement):
                 raise TypeError("Una variable ODE dejó de pertenecer al estado.")
             variable.constraints.validate(values, f"Trayectoria '{variable.name}'")
 
         if commit:
-            final_values = {
-                element_id: float(values[-1])
-                for element_id, values in values_by_id.items()
+            updates_by_state: dict[SystemState, dict[UUID, float]] = {}
+            for element_id, values in values_by_id.items():
+                updates_by_state.setdefault(
+                    self._state_by_element[element_id],
+                    {},
+                )[element_id] = float(values[-1])
+            validated_by_state = {
+                state: state.validate_values(updates)
+                for state, updates in updates_by_state.items()
             }
-            validated = self.state.validate_values(final_values)
-            self.state._commit_validated_values(validated, record_history=False)
-            for history, _ in tuple(self.state._history_recorders):
-                for index, time_value in enumerate(result.t):
-                    sample_values = {
-                        element_id: float(element._value)
-                        for element_id, element in self.state.elements.items()
-                        if isinstance(element, VariableElement)
-                        and element._value is not None
-                    }
-                    sample_values.update(
-                        {
-                            element_id: float(values[index])
-                            for element_id, values in values_by_id.items()
-                        }
-                    )
-                    history.record_values(
-                        self.state.identificator.id,
-                        float(time_value),
-                        sample_values,
-                    )
+            for state, updates in validated_by_state.items():
+                state._commit_validated_values(updates, record_history=False)
+            for state in self.states:
+                state_values = {
+                    element_id: float(element._value)
+                    for element_id, element in state.elements.items()
+                    if isinstance(element, VariableElement)
+                    and element._value is not None
+                }
+                for history, _ in tuple(state._history_recorders):
+                    for index, time_value in enumerate(result.t):
+                        sample_values = dict(state_values)
+                        sample_values.update(
+                            {
+                                element_id: float(values[index])
+                                for element_id, values in values_by_id.items()
+                                if self._state_by_element[element_id] is state
+                            }
+                        )
+                        history.record_values(
+                            state.identificator.id,
+                            float(time_value),
+                            sample_values,
+                        )
 
         return ODETrajectory(np.asarray(result.t, dtype=float).copy(), values_by_id)
 
@@ -1006,6 +1096,7 @@ class ProcessValueScope(Enum):
 
 class ProcessExpressionOperator(Enum):
     CONSTANT = auto()
+    DISCRETE_CONSTANT = auto()
     READ = auto()
     ADD = auto()
     SUBTRACT = auto()
@@ -1037,6 +1128,7 @@ class ProcessActionKind(Enum):
     APPLY_STATE_COUPLING = auto()
     SET_COMPONENT_VALUE = auto()
     PROPAGATE_STATE_COUPLINGS = auto()
+    ADVANCE_FLOW_BUS = auto()
 
 class ProcessValueRef(Entity):
     
@@ -1074,7 +1166,7 @@ class ProcessExpression(Entity):
         systemic_space: SystemicSpace,
         operator: ProcessExpressionOperator,
         operands: tuple[UUID, ...] = (),
-        value: Optional[float] = None,
+        value: Optional[StateValue] = None,
         value_ref_id: Optional[UUID] = None,
     ) -> None:
         super().__init__(systemic_space)
@@ -1090,11 +1182,25 @@ class ProcessExpression(Entity):
         system: System,
         token: Optional[Token],
         now: float = 0.0,
-    ) -> float:
-        if self.operator is ProcessExpressionOperator.CONSTANT:
+    ) -> StateValue:
+        if self.operator in (
+            ProcessExpressionOperator.CONSTANT,
+            ProcessExpressionOperator.DISCRETE_CONSTANT,
+        ):
             if self.value is None or self.operands or self.value_ref_id is not None:
-                raise ValueError("La expresión CONSTANT requiere solo un valor.")
-            result = self.value
+                raise ValueError(
+                    f"La expresión {self.operator.name} requiere solo un valor."
+                )
+            if self.operator is ProcessExpressionOperator.CONSTANT:
+                if isinstance(self.value, (str, Enum)) or not isinstance(
+                    self.value, (int, float, np.number)
+                ):
+                    raise TypeError("CONSTANT requiere un valor numérico.")
+                result: StateValue = float(self.value)
+            else:
+                if not isinstance(self.value, (str, int, bool, Enum)):
+                    raise TypeError("DISCRETE_CONSTANT requiere un valor categórico.")
+                result = self.value
         elif self.operator is ProcessExpressionOperator.READ:
             if self.value_ref_id is None or self.operands or self.value is not None:
                 raise ValueError("La expresión READ requiere solo value_ref_id.")
@@ -1122,9 +1228,7 @@ class ProcessExpression(Entity):
                 raise ValueError("La referencia de estado carece de element_id.")
             referenced_element = state.elements.get(reference.element_id)
             if isinstance(referenced_element, DiscreteStateElement):
-                raise TypeError(
-                    "ProcessExpression solo puede leer valores numéricos."
-                )
+                return state.read_discrete_value(reference.element_id)
             raw_value = state.read_element(reference.element_id)
             if isinstance(raw_value, np.ndarray):
                 if raw_value.ndim != 0:
@@ -1145,6 +1249,13 @@ class ProcessExpression(Entity):
                 if not isinstance(operand, ProcessExpression):
                     raise TypeError("Los operandos deben referir a ProcessExpression.")
                 values.append(operand.evaluate(system, token, now))
+            if any(
+                isinstance(value, (str, bool, Enum))
+                or not isinstance(value, (int, float, np.number))
+                for value in values
+            ):
+                raise TypeError("Las operaciones aritméticas requieren operandos numéricos.")
+            values = [float(value) for value in values]
             arities = {
                 ProcessExpressionOperator.NEGATE: 1,
                 ProcessExpressionOperator.ADD: 2,
@@ -1179,6 +1290,12 @@ class ProcessExpression(Entity):
                 result = min(values)
             else:
                 result = max(values)
+        if isinstance(result, (str, bool, Enum)):
+            return result
+        if isinstance(result, int):
+            return result
+        if not isinstance(result, (int, float, np.number)):
+            raise TypeError("La expresión del proceso produjo un valor no escalar.")
         if not np.isfinite(result):
             raise ValueError("La expresión del proceso produjo un valor no finito.")
         return float(result)
@@ -1226,6 +1343,17 @@ class ProcessCondition(Entity):
                 values.append(operand.evaluate(system, token, now))
             else:
                 raise TypeError("Los operandos deben ser expresiones o condiciones.")
+        if self.operator in (
+            ProcessConditionOperator.LESS,
+            ProcessConditionOperator.LESS_EQUAL,
+            ProcessConditionOperator.GREATER,
+            ProcessConditionOperator.GREATER_EQUAL,
+        ) and any(
+            isinstance(value, (str, bool, Enum))
+            or not isinstance(value, (int, float, np.number))
+            for value in values
+        ):
+            raise TypeError("Las comparaciones de orden requieren valores numéricos.")
         if self.operator is ProcessConditionOperator.NOT:
             return not bool(values[0])
         if self.operator is ProcessConditionOperator.AND:
@@ -1291,7 +1419,7 @@ class ProcessAction(Entity):
         self, systemic_space: SystemicSpace, kind: ProcessActionKind, expression_id: Optional[UUID] = None, state_id: Optional[UUID] = None,
         element_id: Optional[UUID] = None, processor_id: Optional[UUID] = None, port_id: Optional[UUID] = None, token_id: Optional[UUID] = None,
         structure_id: Optional[UUID] = None, relation_id: Optional[UUID] = None,
-        component_id: Optional[UUID] = None,) -> None:
+        component_id: Optional[UUID] = None, duration: Optional[float] = None,) -> None:
         super().__init__(systemic_space)
 
         if kind in (
@@ -1320,6 +1448,19 @@ class ProcessAction(Entity):
             raise ValueError(
                 "PROPAGATE_STATE_COUPLINGS requiere structure_id."
             )
+        if kind is ProcessActionKind.ADVANCE_FLOW_BUS:
+            if structure_id is None or duration is None:
+                raise ValueError(
+                    "ADVANCE_FLOW_BUS requiere structure_id y duration positivo."
+                )
+            if isinstance(duration, bool) or not isinstance(
+                duration, (int, float, np.number)
+            ):
+                raise TypeError("duration debe ser un número.")
+            if not np.isfinite(duration) or duration <= 0:
+                raise ValueError("duration debe ser finito y positivo.")
+        elif duration is not None:
+            raise ValueError("duration solo aplica a ADVANCE_FLOW_BUS.")
         
         self.identificator = Identification(entity=Ontology.EntityType.PROCESS_ACTION)
         self.kind = kind
@@ -1332,6 +1473,7 @@ class ProcessAction(Entity):
         self.structure_id = structure_id
         self.relation_id = relation_id
         self.component_id = component_id
+        self.duration = duration
         self.space_auto_registry()
 
 class Process(Entity):
@@ -1391,10 +1533,11 @@ class Process(Entity):
             if not condition.evaluate(system, token, now):
                 return False
 
-        updates: dict[SystemState, dict[UUID, float]] = {}
+        updates: dict[SystemState, dict[UUID, StateValue]] = {}
         emissions: list[tuple[SystemProcessor, UUID, UUID]] = []
         coupling_actions: list[tuple[StateCouplingStructure, UUID]] = []
         propagation_actions: list[StateCouplingStructure] = []
+        flow_actions: list[tuple[FlowBusStructure, float]] = []
         
         for action_id in self.action_ids:
             action = self.systemic_space.get(action_id)
@@ -1464,6 +1607,15 @@ class Process(Entity):
                         "La estructura de acoplamiento no pertenece al System."
                     )
                 propagation_actions.append(structure)
+            elif action.kind is ProcessActionKind.ADVANCE_FLOW_BUS:
+                if action.structure_id is None or action.duration is None:
+                    raise ValueError(
+                        "ADVANCE_FLOW_BUS requiere structure_id y duration."
+                    )
+                structure = system.structures.get(action.structure_id)
+                if not isinstance(structure, FlowBusStructure):
+                    raise KeyError("El FlowBus no pertenece al System.")
+                flow_actions.append((structure, action.duration))
             else:
                 if action.processor_id is None or action.port_id is None:
                     raise ValueError("EMIT_TOKEN requiere processor_id y port_id.")
@@ -1481,14 +1633,19 @@ class Process(Entity):
         if len(emission_token_ids) != len(set(emission_token_ids)):
             raise ValueError("Un Process no puede emitir el mismo token más de una vez.")
 
-        validated_updates = {state: state.validate_values(state_updates) for state, state_updates in updates.items()}
+        validated_updates = {
+            state: state.validate_state_updates(state_updates)
+            for state, state_updates in updates.items()
+        }
 
         for state, state_updates in validated_updates.items():
-            state._commit_validated_values(state_updates)
+            state._commit_state_updates(state_updates)
         for structure, relation_id in coupling_actions:
             structure.apply_relation(relation_id)
         for structure in propagation_actions:
             structure.propagate()
+        for structure, duration in flow_actions:
+            structure.advance(duration, now=now)
         for processor, port_id, emitted_token_id in emissions:
             processor.emit_token(emitted_token_id, port_id)
         return True
@@ -1513,6 +1670,43 @@ class Token(Entity):
     def inject_description(self, system : UUID, system_element : UUID) -> None:
         system_entity : System = self.systemic_space.get(system)
         system_entity.suscribe_systemic_description(system_element)
+
+class FlowCohort(Token):
+    """A routed token representing a homogeneous group of discrete agents."""
+
+    def __init__(
+        self,
+        systemic_space: SystemicSpace,
+        population: int,
+        attributes: Optional[Mapping[str, StateValue]] = None,
+        label: Optional[str] = None,
+    ) -> None:
+        if isinstance(population, bool) or not isinstance(population, int) or population <= 0:
+            raise ValueError("population debe ser un entero positivo.")
+        super().__init__(systemic_space, label=label)
+        if not isinstance(self.charge, SystemState):
+            raise RuntimeError("Una cohorte requiere un SystemState.")
+        self.population = population
+        self.attribute_elements: dict[str, UUID] = {}
+        for name, value in (attributes or {}).items():
+            if not name or not name.strip():
+                raise ValueError("Los atributos de una cohorte requieren nombres.")
+            if isinstance(value, (str, bool, Enum)):
+                element = DiscreteStateElement(
+                    systemic_space,
+                    name,
+                    initial_value=value,
+                )
+            elif isinstance(value, (int, float, np.number)):
+                if not np.isfinite(value):
+                    raise ValueError(f"El atributo '{name}' debe ser finito.")
+                element = VariableElement(systemic_space, name, float(value))
+            else:
+                raise TypeError(
+                    "Los atributos de cohorte deben ser valores escalares numéricos o categóricos."
+                )
+            self.charge.add_element(element.identificator.id)
+            self.attribute_elements[name] = element.identificator.id
 
 class Port(Entity):
 
@@ -1640,6 +1834,104 @@ class SystemProcessor(Entity):
         )
         self.token_deposit[genesis_token.identificator.id] = genesis_token
         return genesis_token
+
+    def generate_cohort(
+        self,
+        population: int,
+        attributes: Optional[Mapping[str, StateValue]] = None,
+        label: Optional[str] = None,
+    ) -> FlowCohort:
+        cohort = FlowCohort(
+            self.systemic_space,
+            population,
+            attributes,
+            label,
+        )
+        self.token_deposit[cohort.identificator.id] = cohort
+        return cohort
+
+    def merge_cohorts(self, cohort_ids: Sequence[UUID]) -> FlowCohort:
+        identifiers = tuple(cohort_ids)
+        if len(identifiers) < 2 or len(set(identifiers)) != len(identifiers):
+            raise ValueError("merge_cohorts requiere al menos dos IDs únicos.")
+        cohorts = []
+        for cohort_id in identifiers:
+            cohort = self.token_deposit.get(cohort_id)
+            if not isinstance(cohort, FlowCohort):
+                raise KeyError("Todas las cohortes deben estar depositadas aquí.")
+            cohorts.append(cohort)
+        reference_state = cohorts[0].charge
+        if not isinstance(reference_state, SystemState):
+            raise RuntimeError("Una cohorte dejó de contener un SystemState.")
+        reference_values = {
+            element.name: reference_state.read_element(element_id)
+            for element_id, element in reference_state.elements.items()
+            if isinstance(element, (VariableElement, DiscreteStateElement))
+        }
+        for cohort in cohorts[1:]:
+            state = cohort.charge
+            if not isinstance(state, SystemState):
+                raise RuntimeError("Una cohorte dejó de contener un SystemState.")
+            values = {
+                element.name: state.read_element(element_id)
+                for element_id, element in state.elements.items()
+                if isinstance(element, (VariableElement, DiscreteStateElement))
+            }
+            if values != reference_values:
+                raise ValueError("Solo se pueden fusionar cohortes con el mismo estado.")
+        cohorts[0].population = sum(cohort.population for cohort in cohorts)
+        for cohort in cohorts[1:]:
+            self.token_deposit.pop(cohort.identificator.id)
+        return cohorts[0]
+
+    def split_cohort(
+        self,
+        cohort_id: UUID,
+        population: int,
+        label: Optional[str] = None,
+    ) -> FlowCohort:
+        cohort = self.token_deposit.get(cohort_id)
+        if not isinstance(cohort, FlowCohort):
+            raise KeyError("La cohorte debe estar depositada en este processor.")
+        if (
+            isinstance(population, bool)
+            or not isinstance(population, int)
+            or population <= 0
+            or population >= cohort.population
+        ):
+            raise ValueError(
+                "population debe ser positivo y menor que la cohorte original."
+            )
+        state = cohort.charge
+        if not isinstance(state, SystemState):
+            raise RuntimeError("Una cohorte dejó de contener un SystemState.")
+        attributes: dict[str, StateValue] = {}
+        for element_id, element in state.elements.items():
+            if isinstance(element, VariableElement):
+                attributes[element.name] = state.read_value(element_id)
+            elif isinstance(element, DiscreteStateElement):
+                attributes[element.name] = state.read_discrete_value(element_id)
+        split = self.generate_cohort(population, attributes, label)
+        split_state = split.charge
+        if not isinstance(split_state, SystemState):
+            raise RuntimeError("La cohorte dividida debe contener un SystemState.")
+        for element in state.elements.values():
+            if not isinstance(element, (VariableElement, DiscreteStateElement)):
+                continue
+            split_element_id = split.attribute_elements[element.name]
+            split_element = split_state.elements[split_element_id]
+            if isinstance(element, VariableElement) and isinstance(
+                split_element,
+                VariableElement,
+            ):
+                split_element.constraints = element.constraints
+            elif isinstance(element, DiscreteStateElement) and isinstance(
+                split_element,
+                DiscreteStateElement,
+            ):
+                split_element.allowed_values = element.allowed_values
+        cohort.population -= population
+        return split
 
     # CONSERVATIVE / ROUTING
 
@@ -1809,7 +2101,7 @@ class SystemStructure(Entity):
         relation_ids = self.topology.get_edge_data(source_id, target_id, default={})
         return tuple(self.relations[edge["relation_id"]] for edge in relation_ids.values())
 
-class StateCouplingRelation(SystemRelation):
+class StateMappingRelation(SystemRelation):
 
     def __init__(
         self,
@@ -1818,7 +2110,7 @@ class StateCouplingRelation(SystemRelation):
         source_element_id: UUID,
         target_component_id: UUID,
         target_element_id: UUID,
-        transform: Callable[[float], float],
+        transform: Callable[..., Any],
         input_constraints: Optional[ValueConstraints] = None,
         output_constraints: Optional[ValueConstraints] = None,
         label: Optional[str] = None,
@@ -1833,12 +2125,20 @@ class StateCouplingRelation(SystemRelation):
             raise ValueError("El acoplamiento debe conectar dos Components distintos.")
         source_element = source_component.system_state.elements.get(source_element_id)
         target_element = target_component.system_state.elements.get(target_element_id)
-        if not isinstance(source_element, VariableElement):
-            raise TypeError("El origen debe ser una VariableElement del estado origen.")
-        if not isinstance(target_element, VariableElement):
-            raise TypeError("El destino debe ser una VariableElement del estado destino.")
+        if not isinstance(source_element, (VariableElement, DiscreteStateElement)):
+            raise TypeError("El origen debe ser un elemento escalar de estado.")
+        if not isinstance(target_element, (VariableElement, DiscreteStateElement)):
+            raise TypeError("El destino debe ser un elemento escalar de estado.")
         if not callable(transform):
             raise TypeError("transform debe ser una función escalar invocable.")
+        if input_constraints is not None and not isinstance(
+            source_element, VariableElement
+        ):
+            raise TypeError("input_constraints solo aplica a variables numéricas.")
+        if output_constraints is not None and not isinstance(
+            target_element, VariableElement
+        ):
+            raise TypeError("output_constraints solo aplica a variables numéricas.")
         if input_constraints is not None and not isinstance(
             input_constraints, ValueConstraints
         ):
@@ -1857,11 +2157,19 @@ class StateCouplingRelation(SystemRelation):
         self.identificator.entity = Ontology.EntityType.STATE_COUPLING_RELATION
         self.source_element_id = source_element_id
         self.target_element_id = target_element_id
-        self.transform = transform
-        self.input_constraints = input_constraints or source_element.constraints
-        self.output_constraints = output_constraints or target_element.constraints
+        self.transform: Callable[..., Any] = transform
+        self.input_constraints = input_constraints or (
+            source_element.constraints
+            if isinstance(source_element, VariableElement)
+            else None
+        )
+        self.output_constraints = output_constraints or (
+            target_element.constraints
+            if isinstance(target_element, VariableElement)
+            else None
+        )
 
-    def evaluate(self) -> float:
+    def evaluate(self, source_value: Any = None) -> StateValue:
         source_component = self.systemic_space.get(self.source_id)
         target_component = self.systemic_space.get(self.target_id)
         if not isinstance(source_component, Component) or not isinstance(
@@ -1871,32 +2179,69 @@ class StateCouplingRelation(SystemRelation):
 
         source_state = source_component.system_state
         target_state = target_component.system_state
-        source_value = source_state.read_value(self.source_element_id)
-        source_value = self.input_constraints.validate(
-            source_value,
-            "Valor de entrada del acoplamiento",
-        )
-        if not isinstance(source_value, float):
-            raise TypeError("El acoplamiento requiere un valor fuente escalar.")
-
-        transformed_value = self.transform(source_value)
-        transformed_value = self.output_constraints.validate(
-            transformed_value,
-            "Resultado del acoplamiento",
-        )
-        if not isinstance(transformed_value, float):
-            raise TypeError("El acoplamiento debe producir un valor escalar.")
+        source_element = source_state.elements.get(self.source_element_id)
         target_element = target_state.elements.get(self.target_element_id)
-        if not isinstance(target_element, VariableElement):
-            raise TypeError("El destino debe seguir siendo una VariableElement.")
-        return float(
-            target_element.constraints.validate(
-                transformed_value,
+        if source_value is None:
+            if isinstance(source_element, VariableElement):
+                source_value = source_state.read_value(self.source_element_id)
+            elif isinstance(source_element, DiscreteStateElement):
+                source_value = source_state.read_discrete_value(self.source_element_id)
+            else:
+                raise TypeError("El elemento fuente dejó de ser un estado escalar.")
+        if isinstance(source_element, VariableElement):
+            if isinstance(source_value, (str, bool, Enum)) or not isinstance(
+                source_value, (int, float, np.number)
+            ):
+                raise TypeError("El origen numérico requiere un valor numérico.")
+            if self.input_constraints is None:
+                raise RuntimeError("Faltan restricciones para el elemento numérico.")
+            validated_source = self.input_constraints.validate(
+                float(source_value),
+                "Valor de entrada del acoplamiento",
+            )
+            if isinstance(validated_source, np.ndarray):
+                if validated_source.ndim != 0:
+                    raise TypeError("El origen del acoplamiento debe ser escalar.")
+                validated_source = validated_source.item()
+            if isinstance(validated_source, (bool, str, Enum)) or not isinstance(
+                validated_source, (int, float, np.number)
+            ):
+                raise TypeError("El origen del acoplamiento debe ser numérico.")
+            source_value = float(validated_source)
+        elif isinstance(source_element, DiscreteStateElement):
+            if not isinstance(source_value, (str, int, bool, Enum)):
+                raise TypeError("El origen categórico requiere un valor discreto.")
+            source_value = source_element.validate_value(source_value)
+        else:
+            raise TypeError("El elemento fuente dejó de ser un estado escalar.")
+        transformed_value = self.transform(source_value)
+        if isinstance(target_element, VariableElement):
+            if isinstance(transformed_value, (str, bool, Enum)) or not isinstance(
+                transformed_value, (int, float, np.number)
+            ):
+                raise TypeError("El destino numérico requiere un valor numérico.")
+            if self.output_constraints is None:
+                raise RuntimeError("Faltan restricciones para el elemento destino.")
+            validated_value = self.output_constraints.validate(
+                float(transformed_value),
                 f"Variable '{target_element.name}'",
             )
-        )
+            if isinstance(validated_value, np.ndarray):
+                if validated_value.ndim != 0:
+                    raise TypeError("El acoplamiento debe producir un escalar numérico.")
+                validated_value = validated_value.item()
+            if isinstance(validated_value, (bool, str, Enum)) or not isinstance(
+                validated_value, (int, float, np.number)
+            ):
+                raise TypeError("El acoplamiento debe producir un escalar numérico.")
+            return float(validated_value)
+        if isinstance(target_element, DiscreteStateElement):
+            if not isinstance(transformed_value, (str, int, bool, Enum)):
+                raise TypeError("El destino categórico requiere un valor discreto.")
+            return target_element.validate_value(transformed_value)
+        raise TypeError("El elemento destino dejó de ser un estado escalar.")
 
-    def apply(self) -> float:
+    def apply(self) -> StateValue:
         value = self.evaluate()
         source_component = self.systemic_space.get(self.source_id)
         target_component = self.systemic_space.get(self.target_id)
@@ -1904,12 +2249,104 @@ class StateCouplingRelation(SystemRelation):
             target_component, Component
         ):
             raise TypeError("Los extremos del acoplamiento deben ser Components.")
-        write_bridge = StateTransducer(
-            consumer=source_component.system_state,
-            provider=target_component.system_state,
-            writable_elements={self.target_element_id},
+        target_component.system_state._commit_state_updates(
+            {self.target_element_id: value}
         )
-        write_bridge.write(self.target_element_id, value)
+        return value
+
+class StateCouplingRelation(StateMappingRelation):
+    def __init__(
+        self,
+        systemic_space: SystemicSpace,
+        source_component_id: UUID,
+        source_element_id: UUID,
+        target_component_id: UUID,
+        target_element_id: UUID,
+        transform: Callable[[float], float],
+        input_constraints: Optional[ValueConstraints] = None,
+        output_constraints: Optional[ValueConstraints] = None,
+        label: Optional[str] = None,
+    ) -> None:
+        source = systemic_space.get(source_component_id)
+        target = systemic_space.get(target_component_id)
+        if not isinstance(source, Component) or not isinstance(target, Component):
+            raise TypeError("Los extremos del acoplamiento deben ser Components.")
+        if not isinstance(source.system_state.elements.get(source_element_id), VariableElement):
+            raise TypeError("El origen debe ser una VariableElement.")
+        if not isinstance(target.system_state.elements.get(target_element_id), VariableElement):
+            raise TypeError("El destino debe ser una VariableElement.")
+        super().__init__(
+            systemic_space,
+            source_component_id,
+            source_element_id,
+            target_component_id,
+            target_element_id,
+            transform,
+            input_constraints,
+            output_constraints,
+            label,
+        )
+
+    def evaluate(self, source_value: Optional[float] = None) -> float:
+        value = super().evaluate(source_value)
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+            raise TypeError("StateCouplingRelation debe producir un valor numérico.")
+        return float(value)
+
+    def apply(self) -> float:
+        value = super().apply()
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+            raise TypeError("StateCouplingRelation debe producir un valor numérico.")
+        return float(value)
+
+class CategoricalStateCouplingRelation(StateMappingRelation):
+    def __init__(
+        self,
+        systemic_space: SystemicSpace,
+        source_component_id: UUID,
+        source_element_id: UUID,
+        target_component_id: UUID,
+        target_element_id: UUID,
+        transform: Callable[[DiscreteValue], DiscreteValue],
+        label: Optional[str] = None,
+    ) -> None:
+        source = systemic_space.get(source_component_id)
+        target = systemic_space.get(target_component_id)
+        if not isinstance(source, Component) or not isinstance(target, Component):
+            raise TypeError("Los extremos del acoplamiento deben ser Components.")
+        if not isinstance(
+            source.system_state.elements.get(source_element_id),
+            DiscreteStateElement,
+        ):
+            raise TypeError("El origen debe ser un DiscreteStateElement.")
+        if not isinstance(
+            target.system_state.elements.get(target_element_id),
+            DiscreteStateElement,
+        ):
+            raise TypeError("El destino debe ser un DiscreteStateElement.")
+        super().__init__(
+            systemic_space,
+            source_component_id,
+            source_element_id,
+            target_component_id,
+            target_element_id,
+            transform,
+            label=label,
+        )
+
+    def evaluate(
+        self,
+        source_value: Optional[DiscreteValue] = None,
+    ) -> DiscreteValue:
+        value = super().evaluate(source_value)
+        if not isinstance(value, (str, int, bool, Enum)):
+            raise TypeError("El acoplamiento categórico debe producir un valor discreto.")
+        return value
+
+    def apply(self) -> DiscreteValue:
+        value = super().apply()
+        if not isinstance(value, (str, int, bool, Enum)):
+            raise TypeError("El acoplamiento categórico debe producir un valor discreto.")
         return value
 
 class StateCouplingStructure(SystemStructure):
@@ -1920,30 +2357,138 @@ class StateCouplingStructure(SystemStructure):
 
     def add_relation(self, relation_id: UUID) -> None:
         relation = self.systemic_space.get(relation_id)
-        if not isinstance(relation, StateCouplingRelation):
+        if not isinstance(relation, StateMappingRelation):
             raise TypeError(
-                "StateCouplingStructure solo admite StateCouplingRelation."
+                "StateCouplingStructure solo admite relaciones de mapeo de estado."
             )
         super().add_relation(relation_id)
 
-    def apply_relation(self, relation_id: UUID) -> float:
+    def apply_relation(self, relation_id: UUID) -> StateValue:
         relation = self.relations.get(relation_id)
-        if not isinstance(relation, StateCouplingRelation):
+        if not isinstance(relation, StateMappingRelation):
             raise KeyError("El acoplamiento no pertenece a esta estructura.")
         return relation.apply()
 
-    def propagate(self) -> None:
+    def propagate(
+        self,
+        max_iterations: int = 100,
+        atol: float = 1e-10,
+        rtol: float = 1e-8,
+    ) -> None:
+        """Propagate acyclic mappings in order and cyclic mappings to a fixed point."""
+        if (
+            isinstance(max_iterations, bool)
+            or not isinstance(max_iterations, int)
+            or max_iterations < 1
+        ):
+            raise ValueError("max_iterations debe ser un entero positivo.")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float, np.number))
+            or not np.isfinite(value)
+            or value < 0
+            for value in (atol, rtol)
+        ):
+            raise ValueError("atol y rtol deben ser finitos y no negativos.")
         try:
             ordered_nodes = tuple(nx.topological_sort(self.topology))
-        except nx.NetworkXUnfeasible as error:
-            raise ValueError(
-                "La propagación de acoplamientos requiere un grafo acíclico."
-            ) from error
+        except nx.NetworkXUnfeasible:
+            self._propagate_cyclic(max_iterations, atol, rtol)
+            return
 
         for source_id in ordered_nodes:
             for target_id in self.topology.successors(source_id):
                 for edge in self.topology[source_id][target_id].values():
                     self.apply_relation(edge["relation_id"])
+
+    def _propagate_cyclic(
+        self,
+        max_iterations: int,
+        atol: float,
+        rtol: float,
+    ) -> None:
+        relations = tuple(
+            relation
+            for relation in self.relations.values()
+            if isinstance(relation, StateMappingRelation)
+        )
+        target_keys = [
+            (relation.target_id, relation.target_element_id)
+            for relation in relations
+        ]
+        if len(target_keys) != len(set(target_keys)):
+            raise ValueError(
+                "La propagación cíclica requiere una sola relación escritora "
+                "por elemento destino."
+            )
+
+        values: dict[tuple[UUID, UUID], StateValue] = {}
+        for relation in relations:
+            for component_id, element_id in (
+                (relation.source_id, relation.source_element_id),
+                (relation.target_id, relation.target_element_id),
+            ):
+                component = self.systemic_space.get(component_id)
+                if not isinstance(component, Component):
+                    raise TypeError("Los extremos del acoplamiento deben ser Components.")
+                element = component.system_state.elements.get(element_id)
+                if isinstance(element, VariableElement):
+                    value: StateValue = component.system_state.read_value(element_id)
+                elif isinstance(element, DiscreteStateElement):
+                    value = component.system_state.read_discrete_value(element_id)
+                else:
+                    raise TypeError("Cada relación debe conectar estados escalares.")
+                values[(component_id, element_id)] = value
+
+        converged = False
+        for _ in range(max_iterations):
+            next_values = dict(values)
+            for relation in relations:
+                source_key = (relation.source_id, relation.source_element_id)
+                target_key = (relation.target_id, relation.target_element_id)
+                next_values[target_key] = relation.evaluate(values[source_key])
+
+            converged = True
+            for key, next_value in next_values.items():
+                previous_value = values[key]
+                if (
+                    isinstance(previous_value, (int, float, np.number))
+                    and not isinstance(previous_value, bool)
+                    and isinstance(next_value, (int, float, np.number))
+                    and not isinstance(next_value, bool)
+                ):
+                    if not np.isclose(
+                        float(previous_value),
+                        float(next_value),
+                        atol=atol,
+                        rtol=rtol,
+                    ):
+                        converged = False
+                        break
+                elif previous_value != next_value:
+                    converged = False
+                    break
+            values = next_values
+            if converged:
+                break
+
+        if not converged:
+            raise RuntimeError(
+                f"La propagación cíclica no convergió en {max_iterations} iteraciones."
+            )
+
+        updates_by_state: dict[SystemState, dict[UUID, StateValue]] = {}
+        for (component_id, element_id), value in values.items():
+            component = self.systemic_space.get(component_id)
+            if not isinstance(component, Component):
+                raise TypeError("Los extremos del acoplamiento deben ser Components.")
+            updates_by_state.setdefault(component.system_state, {})[element_id] = value
+        validated_updates = {
+            state: state.validate_state_updates(updates)
+            for state, updates in updates_by_state.items()
+        }
+        for state, updates in validated_updates.items():
+            state._commit_state_updates(updates)
 
 class FlowBusRelation(SystemRelation):
 
@@ -2012,6 +2557,138 @@ class FlowBusStructure(SystemStructure):
                 raise KeyError("El Port asociado a la relación dejó de existir.")
             ports.append(port)
         return tuple(ports)
+
+    def advance(self, duration: float, now: float = 0.0) -> dict[UUID, float]:
+        """Transfer all continuous flows simultaneously, conserving each quantity."""
+        if isinstance(duration, bool) or not isinstance(
+            duration, (int, float, np.number)
+        ):
+            raise TypeError("duration debe ser numérico.")
+        if isinstance(now, bool) or not isinstance(now, (int, float, np.number)):
+            raise TypeError("now debe ser numérico.")
+        interval = float(duration)
+        simulation_time = float(now)
+        if not isfinite(interval) or interval <= 0:
+            raise ValueError("duration debe ser finito y positivo.")
+        if not isfinite(simulation_time) or simulation_time < 0:
+            raise ValueError("now debe ser finito y no negativo.")
+
+        flow_relations = tuple(
+            relation
+            for relation in self.relations.values()
+            if isinstance(relation, ContinuousFlowRelation)
+        )
+        if not flow_relations:
+            return {}
+
+        snapshots: dict[tuple[SystemState, UUID], float] = {}
+        transfers: dict[UUID, float] = {}
+        deltas: dict[tuple[SystemState, UUID], float] = {}
+        outflows: dict[tuple[SystemState, UUID], float] = {}
+        for relation in flow_relations:
+            source = self.systemic_space.get(relation.source_id)
+            target = self.systemic_space.get(relation.target_id)
+            if not isinstance(source, SystemProcessor) or not isinstance(
+                target, SystemProcessor
+            ):
+                raise TypeError("Los extremos del flujo continuo deben ser processors.")
+            if source.system_state is None or target.system_state is None:
+                raise RuntimeError("Ambos processors deben tener un SystemState vinculado.")
+            source_key = (source.system_state, relation.source_element_id)
+            target_key = (target.system_state, relation.target_element_id)
+            for state, element_id in (source_key, target_key):
+                if (state, element_id) not in snapshots:
+                    snapshots[(state, element_id)] = state.read_value(element_id)
+
+            source_value = snapshots[source_key]
+            target_value = snapshots[target_key]
+            if source_value < 0 or target_value < 0:
+                raise ValueError("Los inventarios de flujo no pueden ser negativos.")
+            rate = relation.rate
+            evaluated_rate = (
+                rate(simulation_time, source_value, target_value)
+                if callable(rate)
+                else rate
+            )
+            if isinstance(evaluated_rate, bool) or not isinstance(
+                evaluated_rate, (int, float, np.number)
+            ):
+                raise TypeError("La tasa de flujo debe ser numérica.")
+            if not np.isfinite(evaluated_rate) or evaluated_rate < 0:
+                raise ValueError("La tasa de flujo debe ser finita y no negativa.")
+            amount = float(evaluated_rate) * interval
+            if not isfinite(amount):
+                raise ValueError("La cantidad transferida debe ser finita.")
+            transfers[relation.identificator.id] = amount
+            outflows[source_key] = outflows.get(source_key, 0.0) + amount
+            deltas[source_key] = deltas.get(source_key, 0.0) - amount
+            deltas[target_key] = deltas.get(target_key, 0.0) + amount
+
+        for key, amount in outflows.items():
+            available = snapshots[key]
+            if amount > available:
+                raise ValueError(
+                    "La cantidad solicitada excede el inventario disponible."
+                )
+
+        updates_by_state: dict[SystemState, dict[UUID, float]] = {}
+        for (state, element_id), delta in deltas.items():
+            updates_by_state.setdefault(state, {})[element_id] = (
+                snapshots[(state, element_id)] + delta
+            )
+        validated_updates = {
+            state: state.validate_values(updates)
+            for state, updates in updates_by_state.items()
+        }
+        for state, updates in validated_updates.items():
+            state._commit_validated_values(updates)
+        return transfers
+
+class ContinuousFlowRelation(FlowBusRelation):
+    """Directed quantity transfer at a rate measured in quantity units per second."""
+
+    def __init__(
+        self,
+        systemic_space: SystemicSpace,
+        source_processor_id: UUID,
+        source_element_id: UUID,
+        target_processor_id: UUID,
+        target_element_id: UUID,
+        rate: Union[float, Callable[[float, float, float], float]],
+        label: Optional[str] = None,
+        port_id: Optional[UUID] = None,
+    ) -> None:
+        source = systemic_space.get(source_processor_id)
+        target = systemic_space.get(target_processor_id)
+        if not isinstance(source, SystemProcessor) or not isinstance(
+            target, SystemProcessor
+        ):
+            raise TypeError("Un flujo continuo requiere processors como extremos.")
+        if source.system_state is None or target.system_state is None:
+            raise RuntimeError("Los processors requieren SystemState antes del flujo.")
+        if not isinstance(source.system_state.elements.get(source_element_id), VariableElement):
+            raise TypeError("El origen del flujo debe ser una variable numérica.")
+        if not isinstance(target.system_state.elements.get(target_element_id), VariableElement):
+            raise TypeError("El destino del flujo debe ser una variable numérica.")
+        if callable(rate):
+            flow_rate = rate
+        elif isinstance(rate, (int, float, np.number)) and not isinstance(rate, bool):
+            if not np.isfinite(rate) or rate < 0:
+                raise ValueError("rate debe ser finito y no negativo.")
+            flow_rate = float(rate)
+        else:
+            raise TypeError("rate debe ser una tasa numérica o una función de estado.")
+        super().__init__(
+            systemic_space,
+            source_processor_id,
+            target_processor_id,
+            port_id=port_id,
+            label=label,
+        )
+        self.identificator.entity = Ontology.EntityType.FLOW_BUS_RELATION
+        self.source_element_id = source_element_id
+        self.target_element_id = target_element_id
+        self.rate = flow_rate
 
 # ======================================
 # SYSTEMS SEMANTIC DOMAIN
@@ -3230,6 +3907,50 @@ if __name__ == "__main__":
 
     crankshaft = Component(systemic_space)
     camshaft = Component(systemic_space)
+    timing_chain = Component(
+        systemic_space,
+        is_system=True,
+        label="Timing chain",
+    )
+    intake_module = Component(
+        systemic_space,
+        is_system=True,
+        label="Intake",
+    )
+    exhaust_module = Component(
+        systemic_space,
+        is_system=True,
+        label="Exhaust",
+    )
+    if timing_chain.system is None or intake_module.system is None or exhaust_module.system is None:
+        raise RuntimeError("The engine subsystems must have their own System descriptions.")
+    timing_chain_system = timing_chain.system
+    intake_system = intake_module.system
+    exhaust_system = exhaust_module.system
+    bore_diameter_m = 0.086
+    stroke_length_m = 0.086
+    crank_pin_radius_m = stroke_length_m / 2
+    connecting_rod_length_m = 0.143
+    engine_displacement_l = (
+        np.pi / 4 * bore_diameter_m ** 2 * stroke_length_m * 4 * 1000
+    )
+    crank_sprocket_radius_m = 0.03
+    cam_sprocket_radius_m = 0.06
+    target_air_charge_kg = 0.0006
+    stoichiometric_air_fuel_ratio = 14.7
+    fuel_lower_heating_value_j_kg = 44_000_000
+    indicated_thermal_efficiency = 0.28
+    crankshaft_inertia_kg_m2 = 0.18
+    friction_torque_nm = 3.0
+    viscous_friction_nm_per_rad_s = 0.025
+    external_load_torque_nm = 12.0
+    ambient_supply_rate_kg_s = 0.12
+    cylinder_air_flow_rate_kg_s = 0.04
+    exhaust_flow_rate_kg_s = 0.12
+    exhaust_outlet_rate_kg_s = 0.25
+    initial_ambient_air_kg = 2.0
+    initial_manifold_air_kg = 0.05
+    initial_fuel_kg = 0.25
 
     cylinder_1 = Component(systemic_space)
     piston_1 = Component(systemic_space)
@@ -3269,9 +3990,16 @@ if __name__ == "__main__":
         systemic_space,
         "crank_velocity_deg_s",
         0.0,
-        ValueConstraints(0, 12000),
+        ValueConstraints(0, 60000),
     )
     crankshaft.system_state.add_element(crank_velocity.identificator.id)
+    shaft_energy = VariableElement(
+        systemic_space,
+        "shaft_energy_j",
+        0.0,
+        ValueConstraints(0),
+    )
+    crankshaft.system_state.add_element(shaft_energy.identificator.id)
     engine_cycles = VariableElement(
         systemic_space,
         "engine_cycles",
@@ -3288,10 +4016,44 @@ if __name__ == "__main__":
     crankshaft.system_state.add_element(engine_phase.identificator.id)
     cam_angle = VariableElement(systemic_space, "cam_angle", 0.0, ValueConstraints(0, 360))
     camshaft.system_state.add_element(cam_angle.identificator.id)
+    cam_velocity = VariableElement(
+        systemic_space,
+        "cam_velocity_deg_s",
+        0.0,
+        ValueConstraints(0, 30000),
+    )
+    camshaft.system_state.add_element(cam_velocity.identificator.id)
+    timing_chain_travel = VariableElement(
+        systemic_space,
+        "timing_chain_travel_m",
+        0.0,
+        ValueConstraints(0, 4 * np.pi * crank_sprocket_radius_m),
+    )
+    timing_chain.system_state.add_element(timing_chain_travel.identificator.id)
+    timing_chain_speed = VariableElement(
+        systemic_space,
+        "timing_chain_speed_m_s",
+        0.0,
+        ValueConstraints(0, 100),
+    )
+    timing_chain.system_state.add_element(timing_chain_speed.identificator.id)
+    initial_throttle_position = 0.25
+    throttle_position = VariableElement(
+        systemic_space,
+        "throttle_position",
+        initial_throttle_position,
+        ValueConstraints(0, 1),
+    )
+    intake_module.system_state.add_element(throttle_position.identificator.id)
 
     cylinder_1_phase = VariableElement(systemic_space, "cylinder_1_phase", 0.0, ValueConstraints(0, 720))
     cylinder_1.system_state.add_element(cylinder_1_phase.identificator.id)
-    piston_1_position = VariableElement(systemic_space, "piston_1_position", 0.0, ValueConstraints(0, 0.086))
+    piston_1_position = VariableElement(
+        systemic_space,
+        "piston_1_position",
+        0.0,
+        ValueConstraints(0, stroke_length_m),
+    )
     piston_1.system_state.add_element(piston_1_position.identificator.id)
     pushrod_1_intake = VariableElement(systemic_space, "pushrod_1_intake", 0.0, ValueConstraints(0, 1))
     pushrod_1_exhaust = VariableElement(systemic_space, "pushrod_1_exhaust", 0.0, ValueConstraints(0, 1))
@@ -3307,12 +4069,17 @@ if __name__ == "__main__":
     valves_1.system_state.add_element(valve_1_exhaust.identificator.id)
     spark_1 = VariableElement(systemic_space, "spark_1", 0.0, ValueConstraints(0, 1))
     spark_plug_1.system_state.add_element(spark_1.identificator.id)
-    pressure_1 = VariableElement(systemic_space, "pressure_1", 1.0, ValueConstraints(1, 10))
+    pressure_1 = VariableElement(systemic_space, "pressure_1", 1.0, ValueConstraints(1, 35))
     combustion_1.system_state.add_element(pressure_1.identificator.id)
 
     cylinder_2_phase = VariableElement(systemic_space, "cylinder_2_phase", 540.0, ValueConstraints(0, 720))
     cylinder_2.system_state.add_element(cylinder_2_phase.identificator.id)
-    piston_2_position = VariableElement(systemic_space, "piston_2_position", 0.0, ValueConstraints(0, 0.086))
+    piston_2_position = VariableElement(
+        systemic_space,
+        "piston_2_position",
+        0.0,
+        ValueConstraints(0, stroke_length_m),
+    )
     piston_2.system_state.add_element(piston_2_position.identificator.id)
     pushrod_2_intake = VariableElement(systemic_space, "pushrod_2_intake", 0.0, ValueConstraints(0, 1))
     pushrod_2_exhaust = VariableElement(systemic_space, "pushrod_2_exhaust", 0.0, ValueConstraints(0, 1))
@@ -3328,12 +4095,17 @@ if __name__ == "__main__":
     valves_2.system_state.add_element(valve_2_exhaust.identificator.id)
     spark_2 = VariableElement(systemic_space, "spark_2", 0.0, ValueConstraints(0, 1))
     spark_plug_2.system_state.add_element(spark_2.identificator.id)
-    pressure_2 = VariableElement(systemic_space, "pressure_2", 1.0, ValueConstraints(1, 10))
+    pressure_2 = VariableElement(systemic_space, "pressure_2", 1.0, ValueConstraints(1, 35))
     combustion_2.system_state.add_element(pressure_2.identificator.id)
 
     cylinder_3_phase = VariableElement(systemic_space, "cylinder_3_phase", 180.0, ValueConstraints(0, 720))
     cylinder_3.system_state.add_element(cylinder_3_phase.identificator.id)
-    piston_3_position = VariableElement(systemic_space, "piston_3_position", 0.0, ValueConstraints(0, 0.086))
+    piston_3_position = VariableElement(
+        systemic_space,
+        "piston_3_position",
+        0.0,
+        ValueConstraints(0, stroke_length_m),
+    )
     piston_3.system_state.add_element(piston_3_position.identificator.id)
     pushrod_3_intake = VariableElement(systemic_space, "pushrod_3_intake", 0.0, ValueConstraints(0, 1))
     pushrod_3_exhaust = VariableElement(systemic_space, "pushrod_3_exhaust", 0.0, ValueConstraints(0, 1))
@@ -3349,12 +4121,17 @@ if __name__ == "__main__":
     valves_3.system_state.add_element(valve_3_exhaust.identificator.id)
     spark_3 = VariableElement(systemic_space, "spark_3", 0.0, ValueConstraints(0, 1))
     spark_plug_3.system_state.add_element(spark_3.identificator.id)
-    pressure_3 = VariableElement(systemic_space, "pressure_3", 1.0, ValueConstraints(1, 10))
+    pressure_3 = VariableElement(systemic_space, "pressure_3", 1.0, ValueConstraints(1, 35))
     combustion_3.system_state.add_element(pressure_3.identificator.id)
 
     cylinder_4_phase = VariableElement(systemic_space, "cylinder_4_phase", 360.0, ValueConstraints(0, 720))
     cylinder_4.system_state.add_element(cylinder_4_phase.identificator.id)
-    piston_4_position = VariableElement(systemic_space, "piston_4_position", 0.0, ValueConstraints(0, 0.086))
+    piston_4_position = VariableElement(
+        systemic_space,
+        "piston_4_position",
+        0.0,
+        ValueConstraints(0, stroke_length_m),
+    )
     piston_4.system_state.add_element(piston_4_position.identificator.id)
     pushrod_4_intake = VariableElement(systemic_space, "pushrod_4_intake", 0.0, ValueConstraints(0, 1))
     pushrod_4_exhaust = VariableElement(systemic_space, "pushrod_4_exhaust", 0.0, ValueConstraints(0, 1))
@@ -3370,12 +4147,180 @@ if __name__ == "__main__":
     valves_4.system_state.add_element(valve_4_exhaust.identificator.id)
     spark_4 = VariableElement(systemic_space, "spark_4", 0.0, ValueConstraints(0, 1))
     spark_plug_4.system_state.add_element(spark_4.identificator.id)
-    pressure_4 = VariableElement(systemic_space, "pressure_4", 1.0, ValueConstraints(1, 10))
+    pressure_4 = VariableElement(systemic_space, "pressure_4", 1.0, ValueConstraints(1, 35))
     combustion_4.system_state.add_element(pressure_4.identificator.id)
+
+    ambient_air = SystemProcessor(systemic_space)
+    ambient_air.identificator.label = "Ambient air source"
+    ambient_air_state = SystemState(systemic_space)
+    ambient_air_mass = VariableElement(
+        systemic_space,
+        "ambient_air_mass_kg",
+        initial_ambient_air_kg,
+        ValueConstraints(0),
+    )
+    ambient_air_state.add_element(ambient_air_mass.identificator.id)
+    ambient_air.bind_state(ambient_air_state)
+
+    intake_manifold = SystemProcessor(systemic_space)
+    intake_manifold.identificator.label = "Intake manifold"
+    intake_manifold_state = SystemState(systemic_space)
+    manifold_air_mass = VariableElement(
+        systemic_space,
+        "manifold_air_mass_kg",
+        initial_manifold_air_kg,
+        ValueConstraints(0),
+    )
+    intake_manifold_state.add_element(manifold_air_mass.identificator.id)
+    intake_manifold.bind_state(intake_manifold_state)
+
+    fuel_tank = SystemProcessor(systemic_space)
+    fuel_tank.identificator.label = "Fuel source"
+    fuel_tank_state = SystemState(systemic_space)
+    fuel_tank_mass = VariableElement(
+        systemic_space,
+        "fuel_tank_mass_kg",
+        initial_fuel_kg,
+        ValueConstraints(0),
+    )
+    fuel_tank_state.add_element(fuel_tank_mass.identificator.id)
+    fuel_tank.bind_state(fuel_tank_state)
+
+    cylinder_1_flow = SystemProcessor(systemic_space)
+    cylinder_1_flow.identificator.label = "Cylinder 1 charge"
+    cylinder_1_flow_state = SystemState(systemic_space)
+    cylinder_1_air_mass = VariableElement(
+        systemic_space,
+        "cylinder_1_air_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_1_fuel_mass = VariableElement(
+        systemic_space,
+        "cylinder_1_fuel_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_1_flow_state.add_element(cylinder_1_air_mass.identificator.id)
+    cylinder_1_flow_state.add_element(cylinder_1_fuel_mass.identificator.id)
+    cylinder_1_flow.bind_state(cylinder_1_flow_state)
+
+    cylinder_2_flow = SystemProcessor(systemic_space)
+    cylinder_2_flow.identificator.label = "Cylinder 2 charge"
+    cylinder_2_flow_state = SystemState(systemic_space)
+    cylinder_2_air_mass = VariableElement(
+        systemic_space,
+        "cylinder_2_air_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_2_fuel_mass = VariableElement(
+        systemic_space,
+        "cylinder_2_fuel_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_2_flow_state.add_element(cylinder_2_air_mass.identificator.id)
+    cylinder_2_flow_state.add_element(cylinder_2_fuel_mass.identificator.id)
+    cylinder_2_flow.bind_state(cylinder_2_flow_state)
+
+    cylinder_3_flow = SystemProcessor(systemic_space)
+    cylinder_3_flow.identificator.label = "Cylinder 3 charge"
+    cylinder_3_flow_state = SystemState(systemic_space)
+    cylinder_3_air_mass = VariableElement(
+        systemic_space,
+        "cylinder_3_air_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_3_fuel_mass = VariableElement(
+        systemic_space,
+        "cylinder_3_fuel_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_3_flow_state.add_element(cylinder_3_air_mass.identificator.id)
+    cylinder_3_flow_state.add_element(cylinder_3_fuel_mass.identificator.id)
+    cylinder_3_flow.bind_state(cylinder_3_flow_state)
+
+    cylinder_4_flow = SystemProcessor(systemic_space)
+    cylinder_4_flow.identificator.label = "Cylinder 4 charge"
+    cylinder_4_flow_state = SystemState(systemic_space)
+    cylinder_4_air_mass = VariableElement(
+        systemic_space,
+        "cylinder_4_air_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_4_fuel_mass = VariableElement(
+        systemic_space,
+        "cylinder_4_fuel_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    cylinder_4_flow_state.add_element(cylinder_4_air_mass.identificator.id)
+    cylinder_4_flow_state.add_element(cylinder_4_fuel_mass.identificator.id)
+    cylinder_4_flow.bind_state(cylinder_4_flow_state)
+
+    exhaust_manifold = SystemProcessor(systemic_space)
+    exhaust_manifold.identificator.label = "Exhaust manifold"
+    exhaust_manifold_state = SystemState(systemic_space)
+    exhaust_air_mass = VariableElement(
+        systemic_space,
+        "exhaust_air_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    exhaust_fuel_mass = VariableElement(
+        systemic_space,
+        "exhaust_fuel_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    exhaust_manifold_state.add_element(exhaust_air_mass.identificator.id)
+    exhaust_manifold_state.add_element(exhaust_fuel_mass.identificator.id)
+    exhaust_manifold.bind_state(exhaust_manifold_state)
+
+    tailpipe = SystemProcessor(systemic_space)
+    tailpipe.identificator.label = "Exhaust outlet"
+    tailpipe_state = SystemState(systemic_space)
+    exhaust_outlet_air_mass = VariableElement(
+        systemic_space,
+        "exhaust_outlet_air_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    exhaust_outlet_fuel_mass = VariableElement(
+        systemic_space,
+        "exhaust_outlet_fuel_mass_kg",
+        0.0,
+        ValueConstraints(0),
+    )
+    tailpipe_state.add_element(exhaust_outlet_air_mass.identificator.id)
+    tailpipe_state.add_element(exhaust_outlet_fuel_mass.identificator.id)
+    tailpipe.bind_state(tailpipe_state)
+
+    timing_drive = StateCouplingStructure(systemic_space)
+    timing_drive.add_component(crankshaft.identificator.id)
+    timing_drive.add_component(timing_chain.identificator.id)
+    timing_drive.add_component(camshaft.identificator.id)
+    timing_chain_system.suscribe_systemic_description(
+        timing_chain.system_state.identificator.id,
+    )
+    timing_chain_system.suscribe_systemic_description(
+        crankshaft.system_state.identificator.id,
+    )
+    timing_chain_system.suscribe_systemic_description(
+        camshaft.system_state.identificator.id,
+    )
+    timing_chain_system.suscribe_systemic_description(timing_drive.identificator.id)
 
     coupling = StateCouplingStructure(systemic_space)
     coupling.add_component(crankshaft.identificator.id)
     coupling.add_component(camshaft.identificator.id)
+    coupling.add_component(timing_chain.identificator.id)
+    coupling.add_component(intake_module.identificator.id)
+    coupling.add_component(exhaust_module.identificator.id)
     coupling.add_component(cylinder_1.identificator.id)
     coupling.add_component(piston_1.identificator.id)
     coupling.add_component(pushrod_1.identificator.id)
@@ -3405,130 +4350,273 @@ if __name__ == "__main__":
     coupling.add_component(spark_plug_4.identificator.id)
     coupling.add_component(combustion_4.identificator.id)
 
-    crank_to_cam = StateCouplingRelation(
-        systemic_space, crankshaft.identificator.id, crank_angle.identificator.id,
-        camshaft.identificator.id, cam_angle.identificator.id,
-        lambda value: value / 2, label="crankshaft-to-camshaft",
+    crank_to_chain_travel = StateCouplingRelation(
+        systemic_space,
+        crankshaft.identificator.id,
+        crank_angle.identificator.id,
+        timing_chain.identificator.id,
+        timing_chain_travel.identificator.id,
+        lambda value: np.deg2rad(value % 720) * crank_sprocket_radius_m,
+        label="crankshaft-to-timing-chain travel",
+    )
+    crank_to_chain_speed = StateCouplingRelation(
+        systemic_space,
+        crankshaft.identificator.id,
+        crank_velocity.identificator.id,
+        timing_chain.identificator.id,
+        timing_chain_speed.identificator.id,
+        lambda value: np.deg2rad(value) * crank_sprocket_radius_m,
+        label="crankshaft-to-timing-chain speed",
+    )
+    chain_to_cam = StateCouplingRelation(
+        systemic_space,
+        timing_chain.identificator.id,
+        timing_chain_travel.identificator.id,
+        camshaft.identificator.id,
+        cam_angle.identificator.id,
+        lambda value: np.rad2deg(value / cam_sprocket_radius_m),
+        label="timing-chain-to-camshaft angle",
+    )
+    chain_to_cam_velocity = StateCouplingRelation(
+        systemic_space,
+        timing_chain.identificator.id,
+        timing_chain_speed.identificator.id,
+        camshaft.identificator.id,
+        cam_velocity.identificator.id,
+        lambda value: np.rad2deg(value / cam_sprocket_radius_m),
+        label="timing-chain-to-camshaft speed",
     )
     crank_to_cylinder_1 = StateCouplingRelation(
         systemic_space, crankshaft.identificator.id, crank_angle.identificator.id,
         cylinder_1.identificator.id, cylinder_1_phase.identificator.id,
-        lambda value: value % 720, label="crankshaft-to-cylinder-1",
+        lambda value: (value + 360) % 720, label="crankshaft-to-cylinder-1",
     )
     crank_to_cylinder_2 = StateCouplingRelation(
         systemic_space, crankshaft.identificator.id, crank_angle.identificator.id,
         cylinder_2.identificator.id, cylinder_2_phase.identificator.id,
-        lambda value: (value + 180) % 720, label="crankshaft-to-cylinder-2",
+        lambda value: (value + 540) % 720, label="crankshaft-to-cylinder-2",
     )
     crank_to_cylinder_3 = StateCouplingRelation(
         systemic_space, crankshaft.identificator.id, crank_angle.identificator.id,
         cylinder_3.identificator.id, cylinder_3_phase.identificator.id,
-        lambda value: (value + 540) % 720, label="crankshaft-to-cylinder-3",
+        lambda value: (value + 180) % 720, label="crankshaft-to-cylinder-3",
     )
     crank_to_cylinder_4 = StateCouplingRelation(
         systemic_space, crankshaft.identificator.id, crank_angle.identificator.id,
         cylinder_4.identificator.id, cylinder_4_phase.identificator.id,
-        lambda value: (value + 360) % 720, label="crankshaft-to-cylinder-4",
+        lambda value: value % 720, label="crankshaft-to-cylinder-4",
     )
     cylinder_1_to_piston = StateCouplingRelation(
         systemic_space, cylinder_1.identificator.id, cylinder_1_phase.identificator.id,
         piston_1.identificator.id, piston_1_position.identificator.id,
-        lambda value: 0.043 * (1 - np.cos(np.deg2rad(value))),
+        lambda value: (
+            crank_pin_radius_m * (1 - np.cos(np.deg2rad(value)))
+            + connecting_rod_length_m
+            - np.sqrt(
+                connecting_rod_length_m ** 2
+                - (crank_pin_radius_m * np.sin(np.deg2rad(value))) ** 2
+            )
+        ),
     )
     cylinder_2_to_piston = StateCouplingRelation(
         systemic_space, cylinder_2.identificator.id, cylinder_2_phase.identificator.id,
         piston_2.identificator.id, piston_2_position.identificator.id,
-        lambda value: 0.043 * (1 - np.cos(np.deg2rad(value))),
+        lambda value: (
+            crank_pin_radius_m * (1 - np.cos(np.deg2rad(value)))
+            + connecting_rod_length_m
+            - np.sqrt(
+                connecting_rod_length_m ** 2
+                - (crank_pin_radius_m * np.sin(np.deg2rad(value))) ** 2
+            )
+        ),
     )
     cylinder_3_to_piston = StateCouplingRelation(
         systemic_space, cylinder_3.identificator.id, cylinder_3_phase.identificator.id,
         piston_3.identificator.id, piston_3_position.identificator.id,
-        lambda value: 0.043 * (1 - np.cos(np.deg2rad(value))),
+        lambda value: (
+            crank_pin_radius_m * (1 - np.cos(np.deg2rad(value)))
+            + connecting_rod_length_m
+            - np.sqrt(
+                connecting_rod_length_m ** 2
+                - (crank_pin_radius_m * np.sin(np.deg2rad(value))) ** 2
+            )
+        ),
     )
     cylinder_4_to_piston = StateCouplingRelation(
         systemic_space, cylinder_4.identificator.id, cylinder_4_phase.identificator.id,
         piston_4.identificator.id, piston_4_position.identificator.id,
-        lambda value: 0.043 * (1 - np.cos(np.deg2rad(value))),
+        lambda value: (
+            crank_pin_radius_m * (1 - np.cos(np.deg2rad(value)))
+            + connecting_rod_length_m
+            - np.sqrt(
+                connecting_rod_length_m ** 2
+                - (crank_pin_radius_m * np.sin(np.deg2rad(value))) ** 2
+            )
+        ),
     )
     cylinder_1_to_spark = StateCouplingRelation(
         systemic_space, cylinder_1.identificator.id, cylinder_1_phase.identificator.id,
         spark_plug_1.identificator.id, spark_1.identificator.id,
-        lambda value: float(value < 2 or value > 718),
+        lambda value: float(abs(value - 360) <= 2),
     )
     cylinder_2_to_spark = StateCouplingRelation(
         systemic_space, cylinder_2.identificator.id, cylinder_2_phase.identificator.id,
         spark_plug_2.identificator.id, spark_2.identificator.id,
-        lambda value: float(value < 2 or value > 718),
+        lambda value: float(abs(value - 360) <= 2),
     )
     cylinder_3_to_spark = StateCouplingRelation(
         systemic_space, cylinder_3.identificator.id, cylinder_3_phase.identificator.id,
         spark_plug_3.identificator.id, spark_3.identificator.id,
-        lambda value: float(value < 2 or value > 718),
+        lambda value: float(abs(value - 360) <= 2),
     )
     cylinder_4_to_spark = StateCouplingRelation(
         systemic_space, cylinder_4.identificator.id, cylinder_4_phase.identificator.id,
         spark_plug_4.identificator.id, spark_4.identificator.id,
-        lambda value: float(value < 2 or value > 718),
+        lambda value: float(abs(value - 360) <= 2),
     )
     cylinder_1_to_pressure = StateCouplingRelation(
         systemic_space, cylinder_1.identificator.id, cylinder_1_phase.identificator.id,
         combustion_1.identificator.id, pressure_1.identificator.id,
-        lambda value: 1 + 9 * np.exp(-0.5 * (min(value, 720 - value) / 35) ** 2),
+        lambda value: (
+            1
+            + 29
+            * min(
+                1.0,
+                cylinder_1_flow_state.read_value(cylinder_1_air_mass.identificator.id)
+                / target_air_charge_kg,
+                cylinder_1_flow_state.read_value(cylinder_1_fuel_mass.identificator.id)
+                / (target_air_charge_kg / stoichiometric_air_fuel_ratio),
+            )
+            * np.exp(-0.5 * ((value - 380) / 40) ** 2)
+            if 360 <= value <= 540
+            else 1.0
+        ),
     )
     cylinder_2_to_pressure = StateCouplingRelation(
         systemic_space, cylinder_2.identificator.id, cylinder_2_phase.identificator.id,
         combustion_2.identificator.id, pressure_2.identificator.id,
-        lambda value: 1 + 9 * np.exp(-0.5 * (min(value, 720 - value) / 35) ** 2),
+        lambda value: (
+            1
+            + 29
+            * min(
+                1.0,
+                cylinder_2_flow_state.read_value(cylinder_2_air_mass.identificator.id)
+                / target_air_charge_kg,
+                cylinder_2_flow_state.read_value(cylinder_2_fuel_mass.identificator.id)
+                / (target_air_charge_kg / stoichiometric_air_fuel_ratio),
+            )
+            * np.exp(-0.5 * ((value - 380) / 40) ** 2)
+            if 360 <= value <= 540
+            else 1.0
+        ),
     )
     cylinder_3_to_pressure = StateCouplingRelation(
         systemic_space, cylinder_3.identificator.id, cylinder_3_phase.identificator.id,
         combustion_3.identificator.id, pressure_3.identificator.id,
-        lambda value: 1 + 9 * np.exp(-0.5 * (min(value, 720 - value) / 35) ** 2),
+        lambda value: (
+            1
+            + 29
+            * min(
+                1.0,
+                cylinder_3_flow_state.read_value(cylinder_3_air_mass.identificator.id)
+                / target_air_charge_kg,
+                cylinder_3_flow_state.read_value(cylinder_3_fuel_mass.identificator.id)
+                / (target_air_charge_kg / stoichiometric_air_fuel_ratio),
+            )
+            * np.exp(-0.5 * ((value - 380) / 40) ** 2)
+            if 360 <= value <= 540
+            else 1.0
+        ),
     )
     cylinder_4_to_pressure = StateCouplingRelation(
         systemic_space, cylinder_4.identificator.id, cylinder_4_phase.identificator.id,
         combustion_4.identificator.id, pressure_4.identificator.id,
-        lambda value: 1 + 9 * np.exp(-0.5 * (min(value, 720 - value) / 35) ** 2),
+        lambda value: (
+            1
+            + 29
+            * min(
+                1.0,
+                cylinder_4_flow_state.read_value(cylinder_4_air_mass.identificator.id)
+                / target_air_charge_kg,
+                cylinder_4_flow_state.read_value(cylinder_4_fuel_mass.identificator.id)
+                / (target_air_charge_kg / stoichiometric_air_fuel_ratio),
+            )
+            * np.exp(-0.5 * ((value - 380) / 40) ** 2)
+            if 360 <= value <= 540
+            else 1.0
+        ),
     )
     cam_to_pushrod_1_intake = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_1.identificator.id, pushrod_1_intake.identificator.id,
-        lambda value: max(0, np.sin(np.deg2rad(value))),
+        lambda value: (
+            np.sin(np.deg2rad(((value + 180) % 360) * 2))
+            if (value + 180) % 360 <= 90
+            else 0
+        ),
     )
     cam_to_pushrod_1_exhaust = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_1.identificator.id, pushrod_1_exhaust.identificator.id,
-        lambda value: max(0, -np.sin(np.deg2rad(value))),
+        lambda value: (
+            np.sin(np.deg2rad((((value + 180) % 360) - 270) * 2))
+            if (value + 180) % 360 >= 270
+            else 0
+        ),
     )
     cam_to_pushrod_2_intake = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_2.identificator.id, pushrod_2_intake.identificator.id,
-        lambda value: max(0, np.sin(np.deg2rad(value + 90))),
+        lambda value: (
+            np.sin(np.deg2rad(((value + 270) % 360) * 2))
+            if (value + 270) % 360 <= 90
+            else 0
+        ),
     )
     cam_to_pushrod_2_exhaust = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_2.identificator.id, pushrod_2_exhaust.identificator.id,
-        lambda value: max(0, -np.sin(np.deg2rad(value + 90))),
+        lambda value: (
+            np.sin(np.deg2rad((((value + 270) % 360) - 270) * 2))
+            if (value + 270) % 360 >= 270
+            else 0
+        ),
     )
     cam_to_pushrod_3_intake = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_3.identificator.id, pushrod_3_intake.identificator.id,
-        lambda value: max(0, np.sin(np.deg2rad(value + 270))),
+        lambda value: (
+            np.sin(np.deg2rad(((value + 90) % 360) * 2))
+            if (value + 90) % 360 <= 90
+            else 0
+        ),
     )
     cam_to_pushrod_3_exhaust = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_3.identificator.id, pushrod_3_exhaust.identificator.id,
-        lambda value: max(0, -np.sin(np.deg2rad(value + 270))),
+        lambda value: (
+            np.sin(np.deg2rad((((value + 90) % 360) - 270) * 2))
+            if (value + 90) % 360 >= 270
+            else 0
+        ),
     )
     cam_to_pushrod_4_intake = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_4.identificator.id, pushrod_4_intake.identificator.id,
-        lambda value: max(0, np.sin(np.deg2rad(value + 180))),
+        lambda value: (
+            np.sin(np.deg2rad((value % 360) * 2))
+            if value % 360 <= 90
+            else 0
+        ),
     )
     cam_to_pushrod_4_exhaust = StateCouplingRelation(
         systemic_space, camshaft.identificator.id, cam_angle.identificator.id,
         pushrod_4.identificator.id, pushrod_4_exhaust.identificator.id,
-        lambda value: max(0, -np.sin(np.deg2rad(value + 180))),
+        lambda value: (
+            np.sin(np.deg2rad(((value % 360) - 270) * 2))
+            if value % 360 >= 270
+            else 0
+        ),
     )
 
     pushrod_to_rocker_1_intake = StateCouplingRelation(
@@ -3613,7 +4701,10 @@ if __name__ == "__main__":
         lambda value: value,
     )
 
-    coupling.add_relation(crank_to_cam.identificator.id)
+    timing_drive.add_relation(crank_to_chain_travel.identificator.id)
+    timing_drive.add_relation(crank_to_chain_speed.identificator.id)
+    timing_drive.add_relation(chain_to_cam.identificator.id)
+    timing_drive.add_relation(chain_to_cam_velocity.identificator.id)
     coupling.add_relation(crank_to_cylinder_1.identificator.id)
     coupling.add_relation(crank_to_cylinder_2.identificator.id)
     coupling.add_relation(crank_to_cylinder_3.identificator.id)
@@ -3657,6 +4748,17 @@ if __name__ == "__main__":
 
     engine.suscribe_systemic_description(crankshaft.system_state.identificator.id)
     engine.suscribe_systemic_description(camshaft.system_state.identificator.id)
+    engine.suscribe_systemic_description(timing_chain.system_state.identificator.id)
+    engine.suscribe_systemic_description(intake_module.system_state.identificator.id)
+    engine.suscribe_systemic_description(ambient_air_state.identificator.id)
+    engine.suscribe_systemic_description(intake_manifold_state.identificator.id)
+    engine.suscribe_systemic_description(fuel_tank_state.identificator.id)
+    engine.suscribe_systemic_description(cylinder_1_flow_state.identificator.id)
+    engine.suscribe_systemic_description(cylinder_2_flow_state.identificator.id)
+    engine.suscribe_systemic_description(cylinder_3_flow_state.identificator.id)
+    engine.suscribe_systemic_description(cylinder_4_flow_state.identificator.id)
+    engine.suscribe_systemic_description(exhaust_manifold_state.identificator.id)
+    engine.suscribe_systemic_description(tailpipe_state.identificator.id)
     engine.suscribe_systemic_description(cylinder_1.system_state.identificator.id)
     engine.suscribe_systemic_description(piston_1.system_state.identificator.id)
     engine.suscribe_systemic_description(pushrod_1.system_state.identificator.id)
@@ -3698,6 +4800,23 @@ if __name__ == "__main__":
     valves_1.identificator.label = "Valves 1"
     spark_plug_1.identificator.label = "Spark plug 1"
     combustion_1.identificator.label = "Combustion 1"
+    timing_chain.system.identificator.label = "Timing-chain subsystem"
+    intake_module.system.identificator.label = "Intake subsystem"
+    exhaust_module.system.identificator.label = "Exhaust subsystem"
+    timing_chain.semantic_attributes = {
+        "drive_type": "roller chain",
+        "ratio": 2.0,
+        "cam_to_crank_ratio": 0.5,
+    }
+    intake_module.semantic_attributes = {
+        "role": "air and fuel intake",
+        "valve_count": 4,
+        "air_fuel_ratio": stoichiometric_air_fuel_ratio,
+    }
+    exhaust_module.semantic_attributes = {
+        "role": "combustion gas outlet",
+        "outlet_count": 1,
+    }
     cylinder_2.identificator.label = "Cylinder 2"
     piston_2.identificator.label = "Piston 2"
     pushrod_2.identificator.label = "Pushrod 2"
@@ -3724,7 +4843,27 @@ if __name__ == "__main__":
         "valve_train": "OHV",
         "firing_order": "1-3-4-2",
         "cylinder_count": 4,
+        "piston_count": 4,
+        "valves_per_cylinder": 2,
+        "total_valves": 8,
+        "bore_mm": bore_diameter_m * 1000,
+        "stroke_mm": stroke_length_m * 1000,
+        "connecting_rod_mm": connecting_rod_length_m * 1000,
+        "displacement_l": engine_displacement_l,
         "cycle_angle_deg": 720,
+    }
+    timing_chain.system.semantic_attributes = {
+        "drive_type": "roller chain",
+        "ratio": 2.0,
+        "cam_to_crank_ratio": 0.5,
+    }
+    intake_module.system.semantic_attributes = {
+        "role": "metered air and fuel input",
+        "air_fuel_ratio": stoichiometric_air_fuel_ratio,
+    }
+    exhaust_module.system.semantic_attributes = {
+        "role": "combustion gas output",
+        "flow_mode": "continuous",
     }
 
     # define_archetype_from_instance registra el System actual como instancia
@@ -3732,9 +4871,42 @@ if __name__ == "__main__":
     engine.semantics.add_tag(engine.identificator.id, "engine")
     engine.semantics.add_tag(engine.identificator.id, "four-stroke")
     engine.semantics.add_tag(engine.identificator.id, "OHV")
+    engine.semantics.add_tag(timing_chain.identificator.id, "timing-drive")
+    engine.semantics.add_tag(intake_module.identificator.id, "intake")
+    engine.semantics.add_tag(exhaust_module.identificator.id, "exhaust")
+    timing_chain_system.semantics.add_tag(
+        timing_chain_system.identificator.id,
+        "timing-chain",
+    )
+    intake_system.semantics.add_tag(intake_system.identificator.id, "intake")
+    exhaust_system.semantics.add_tag(exhaust_system.identificator.id, "exhaust")
     engine_archetype = engine.semantics.define_archetype_from_instance(
         "L4 OHV engine",
         engine.identificator.id,
+    )
+    engine.semantics.define_archetype_from_instance(
+        "Timing chain component",
+        timing_chain.identificator.id,
+    )
+    engine.semantics.define_archetype_from_instance(
+        "Intake component",
+        intake_module.identificator.id,
+    )
+    engine.semantics.define_archetype_from_instance(
+        "Exhaust component",
+        exhaust_module.identificator.id,
+    )
+    timing_chain_system.semantics.define_archetype_from_instance(
+        "Timing-chain subsystem",
+        timing_chain_system.identificator.id,
+    )
+    intake_system.semantics.define_archetype_from_instance(
+        "Intake flow subsystem",
+        intake_system.identificator.id,
+    )
+    exhaust_system.semantics.define_archetype_from_instance(
+        "Exhaust flow subsystem",
+        exhaust_system.identificator.id,
     )
     engine.semantics.add_attribute(
         engine_archetype.id,
@@ -3756,11 +4928,62 @@ if __name__ == "__main__":
     )
     engine.semantics.add_attribute(
         engine_archetype.id,
+        SemanticAttribute("piston_count", SemanticValueType.INTEGER, 4, required=True),
+    )
+    engine.semantics.add_attribute(
+        engine_archetype.id,
+        SemanticAttribute("valves_per_cylinder", SemanticValueType.INTEGER, 2, required=True),
+    )
+    engine.semantics.add_attribute(
+        engine_archetype.id,
+        SemanticAttribute("total_valves", SemanticValueType.INTEGER, 8, required=True),
+    )
+    engine.semantics.add_attribute(
+        engine_archetype.id,
+        SemanticAttribute(
+            "bore_mm",
+            SemanticValueType.NUMBER,
+            bore_diameter_m * 1000,
+            required=True,
+        ),
+    )
+    engine.semantics.add_attribute(
+        engine_archetype.id,
+        SemanticAttribute(
+            "stroke_mm",
+            SemanticValueType.NUMBER,
+            stroke_length_m * 1000,
+            required=True,
+        ),
+    )
+    engine.semantics.add_attribute(
+        engine_archetype.id,
+        SemanticAttribute(
+            "connecting_rod_mm",
+            SemanticValueType.NUMBER,
+            connecting_rod_length_m * 1000,
+            required=True,
+        ),
+    )
+    engine.semantics.add_attribute(
+        engine_archetype.id,
+        SemanticAttribute(
+            "displacement_l",
+            SemanticValueType.NUMBER,
+            engine_displacement_l,
+            required=True,
+        ),
+    )
+    engine.semantics.add_attribute(
+        engine_archetype.id,
         SemanticAttribute("cycle_angle_deg", SemanticValueType.INTEGER, 720, required=True),
     )
 
     # add_tag clasifica las entidades por función; los SemanticSet siguientes
-    # son agrupaciones explícitas y su partición cubre los 30 Components.
+    # agrupan los 33 componentes del motor en una partición explícita.
+    engine.semantics.add_tag(timing_chain.identificator.id, "valvetrain")
+    engine.semantics.add_tag(intake_module.identificator.id, "gas-exchange")
+    engine.semantics.add_tag(exhaust_module.identificator.id, "gas-exchange")
     engine.semantics.add_tag(crankshaft.identificator.id, "rotating")
     engine.semantics.add_tag(camshaft.identificator.id, "rotating")
     engine.semantics.add_tag(cylinder_1.identificator.id, "cylinder")
@@ -3799,6 +5022,7 @@ if __name__ == "__main__":
     valvetrain_parts = engine.semantics.define_set("Valve train")
     ignition_parts = engine.semantics.define_set("Ignition")
     combustion_parts = engine.semantics.define_set("Combustion chambers")
+    gas_exchange_parts = engine.semantics.define_set("Gas exchange")
     engine.semantics.add_member(engine_parts.id, crankshaft.identificator.id)
     engine.semantics.add_member(engine_parts.id, camshaft.identificator.id)
     engine.semantics.add_member(engine_parts.id, cylinder_1.identificator.id)
@@ -3829,6 +5053,9 @@ if __name__ == "__main__":
     engine.semantics.add_member(engine_parts.id, valves_4.identificator.id)
     engine.semantics.add_member(engine_parts.id, spark_plug_4.identificator.id)
     engine.semantics.add_member(engine_parts.id, combustion_4.identificator.id)
+    engine.semantics.add_member(engine_parts.id, timing_chain.identificator.id)
+    engine.semantics.add_member(engine_parts.id, intake_module.identificator.id)
+    engine.semantics.add_member(engine_parts.id, exhaust_module.identificator.id)
     engine.semantics.add_member(rotating_parts.id, crankshaft.identificator.id)
     engine.semantics.add_member(rotating_parts.id, camshaft.identificator.id)
     engine.semantics.add_member(cylinder_parts.id, cylinder_1.identificator.id)
@@ -3851,6 +5078,7 @@ if __name__ == "__main__":
     engine.semantics.add_member(valvetrain_parts.id, valves_2.identificator.id)
     engine.semantics.add_member(valvetrain_parts.id, valves_3.identificator.id)
     engine.semantics.add_member(valvetrain_parts.id, valves_4.identificator.id)
+    engine.semantics.add_member(valvetrain_parts.id, timing_chain.identificator.id)
     engine.semantics.add_member(ignition_parts.id, spark_plug_1.identificator.id)
     engine.semantics.add_member(ignition_parts.id, spark_plug_2.identificator.id)
     engine.semantics.add_member(ignition_parts.id, spark_plug_3.identificator.id)
@@ -3859,6 +5087,8 @@ if __name__ == "__main__":
     engine.semantics.add_member(combustion_parts.id, combustion_2.identificator.id)
     engine.semantics.add_member(combustion_parts.id, combustion_3.identificator.id)
     engine.semantics.add_member(combustion_parts.id, combustion_4.identificator.id)
+    engine.semantics.add_member(gas_exchange_parts.id, intake_module.identificator.id)
+    engine.semantics.add_member(gas_exchange_parts.id, exhaust_module.identificator.id)
     engine.semantics.define_partition(
         engine_parts.id,
         (
@@ -3868,6 +5098,7 @@ if __name__ == "__main__":
             valvetrain_parts.id,
             ignition_parts.id,
             combustion_parts.id,
+            gas_exchange_parts.id,
         ),
     )
 
@@ -3875,6 +5106,51 @@ if __name__ == "__main__":
     # is_part_of conserva la transitividad sin duplicar conexiones indirectas.
     engine.semantics.add_part(engine.identificator.id, crankshaft.identificator.id)
     engine.semantics.add_part(engine.identificator.id, camshaft.identificator.id)
+    engine.semantics.add_part(engine.identificator.id, timing_chain.identificator.id)
+    engine.semantics.add_part(engine.identificator.id, intake_module.identificator.id)
+    engine.semantics.add_part(engine.identificator.id, exhaust_module.identificator.id)
+    engine.semantics.add_part(
+        timing_chain.identificator.id,
+        timing_chain_system.identificator.id,
+    )
+    engine.semantics.add_part(
+        intake_module.identificator.id,
+        intake_system.identificator.id,
+    )
+    engine.semantics.add_part(
+        exhaust_module.identificator.id,
+        exhaust_system.identificator.id,
+    )
+    engine.semantics.add_part(
+        intake_module.identificator.id,
+        ambient_air.identificator.id,
+    )
+    engine.semantics.add_part(
+        intake_module.identificator.id,
+        intake_manifold.identificator.id,
+    )
+    engine.semantics.add_part(intake_module.identificator.id, fuel_tank.identificator.id)
+    engine.semantics.add_part(
+        intake_module.identificator.id,
+        cylinder_1_flow.identificator.id,
+    )
+    engine.semantics.add_part(
+        intake_module.identificator.id,
+        cylinder_2_flow.identificator.id,
+    )
+    engine.semantics.add_part(
+        intake_module.identificator.id,
+        cylinder_3_flow.identificator.id,
+    )
+    engine.semantics.add_part(
+        intake_module.identificator.id,
+        cylinder_4_flow.identificator.id,
+    )
+    engine.semantics.add_part(
+        exhaust_module.identificator.id,
+        exhaust_manifold.identificator.id,
+    )
+    engine.semantics.add_part(exhaust_module.identificator.id, tailpipe.identificator.id)
     engine.semantics.add_part(engine.identificator.id, cylinder_1.identificator.id)
     engine.semantics.add_part(engine.identificator.id, cylinder_2.identificator.id)
     engine.semantics.add_part(engine.identificator.id, cylinder_3.identificator.id)
@@ -3910,7 +5186,13 @@ if __name__ == "__main__":
     engine.semantics.add_base_dimension("angle")
     engine.semantics.add_base_dimension("pressure")
     engine.semantics.add_base_dimension("time")
+    engine.semantics.add_base_dimension("mass")
     meter_unit = engine.semantics.define_unit("meter", "m", {"length": 1})
+    meter_per_second_unit = engine.semantics.define_unit(
+        "meter per second",
+        "m/s",
+        {"length": 1, "time": -1},
+    )
     degree_unit = engine.semantics.define_unit("degree", "deg", {"angle": 1})
     degree_per_second_unit = engine.semantics.define_unit(
         "degree per second",
@@ -3919,6 +5201,107 @@ if __name__ == "__main__":
     )
     bar_unit = engine.semantics.define_unit("bar", "bar", {"pressure": 1})
     fraction_unit = engine.semantics.define_unit("fraction", "1", {})
+    kilogram_unit = engine.semantics.define_unit("kilogram", "kg", {"mass": 1})
+    joule_unit = engine.semantics.define_unit(
+        "joule",
+        "J",
+        {"mass": 1, "length": 2, "time": -2},
+    )
+    engine.semantics.bind_state_variable(
+        crankshaft.system_state,
+        shaft_energy.identificator.id,
+        joule_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        timing_chain.system_state,
+        timing_chain_travel.identificator.id,
+        meter_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        timing_chain.system_state,
+        timing_chain_speed.identificator.id,
+        meter_per_second_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        intake_module.system_state,
+        throttle_position.identificator.id,
+        fraction_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        ambient_air_state,
+        ambient_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        intake_manifold_state,
+        manifold_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        fuel_tank_state,
+        fuel_tank_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_1_flow_state,
+        cylinder_1_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_1_flow_state,
+        cylinder_1_fuel_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_2_flow_state,
+        cylinder_2_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_2_flow_state,
+        cylinder_2_fuel_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_3_flow_state,
+        cylinder_3_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_3_flow_state,
+        cylinder_3_fuel_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_4_flow_state,
+        cylinder_4_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        cylinder_4_flow_state,
+        cylinder_4_fuel_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        exhaust_manifold_state,
+        exhaust_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        exhaust_manifold_state,
+        exhaust_fuel_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        tailpipe_state,
+        exhaust_outlet_air_mass.identificator.id,
+        kilogram_unit.id,
+    )
+    engine.semantics.bind_state_variable(
+        tailpipe_state,
+        exhaust_outlet_fuel_mass.identificator.id,
+        kilogram_unit.id,
+    )
     engine.semantics.bind_state_variable(crankshaft.system_state, crank_angle.identificator.id, degree_unit.id)
     engine.semantics.bind_state_variable(
         crankshaft.system_state,
@@ -3931,6 +5314,11 @@ if __name__ == "__main__":
         fraction_unit.id,
     )
     engine.semantics.bind_state_variable(camshaft.system_state, cam_angle.identificator.id, degree_unit.id)
+    engine.semantics.bind_state_variable(
+        camshaft.system_state,
+        cam_velocity.identificator.id,
+        degree_per_second_unit.id,
+    )
     engine.semantics.bind_state_variable(cylinder_1.system_state, cylinder_1_phase.identificator.id, degree_unit.id)
     engine.semantics.bind_state_variable(piston_1.system_state, piston_1_position.identificator.id, meter_unit.id)
     engine.semantics.bind_state_variable(pushrod_1.system_state, pushrod_1_intake.identificator.id, fraction_unit.id)
@@ -3972,6 +5360,612 @@ if __name__ == "__main__":
     engine.semantics.bind_state_variable(spark_plug_4.system_state, spark_4.identificator.id, fraction_unit.id)
     engine.semantics.bind_state_variable(combustion_4.system_state, pressure_4.identificator.id, bar_unit.id)
 
+    engine_sampling_interval = 0.0025
+
+    ambient_to_manifold_port = Port(
+        systemic_space,
+        intake_manifold.identificator.id,
+    )
+    ambient_to_manifold_port.identificator.label = "Intake air inlet"
+    ambient_air.add_port(ambient_to_manifold_port.identificator.id)
+    manifold_to_cylinder_1_port = Port(
+        systemic_space,
+        cylinder_1_flow.identificator.id,
+    )
+    manifold_to_cylinder_1_port.identificator.label = "Cylinder 1 intake"
+    intake_manifold.add_port(manifold_to_cylinder_1_port.identificator.id)
+    manifold_to_cylinder_2_port = Port(
+        systemic_space,
+        cylinder_2_flow.identificator.id,
+    )
+    manifold_to_cylinder_2_port.identificator.label = "Cylinder 2 intake"
+    intake_manifold.add_port(manifold_to_cylinder_2_port.identificator.id)
+    manifold_to_cylinder_3_port = Port(
+        systemic_space,
+        cylinder_3_flow.identificator.id,
+    )
+    manifold_to_cylinder_3_port.identificator.label = "Cylinder 3 intake"
+    intake_manifold.add_port(manifold_to_cylinder_3_port.identificator.id)
+    manifold_to_cylinder_4_port = Port(
+        systemic_space,
+        cylinder_4_flow.identificator.id,
+    )
+    manifold_to_cylinder_4_port.identificator.label = "Cylinder 4 intake"
+    intake_manifold.add_port(manifold_to_cylinder_4_port.identificator.id)
+    fuel_to_cylinder_1_port = Port(systemic_space, cylinder_1_flow.identificator.id)
+    fuel_to_cylinder_1_port.identificator.label = "Cylinder 1 injector"
+    fuel_tank.add_port(fuel_to_cylinder_1_port.identificator.id)
+    fuel_to_cylinder_2_port = Port(systemic_space, cylinder_2_flow.identificator.id)
+    fuel_to_cylinder_2_port.identificator.label = "Cylinder 2 injector"
+    fuel_tank.add_port(fuel_to_cylinder_2_port.identificator.id)
+    fuel_to_cylinder_3_port = Port(systemic_space, cylinder_3_flow.identificator.id)
+    fuel_to_cylinder_3_port.identificator.label = "Cylinder 3 injector"
+    fuel_tank.add_port(fuel_to_cylinder_3_port.identificator.id)
+    fuel_to_cylinder_4_port = Port(systemic_space, cylinder_4_flow.identificator.id)
+    fuel_to_cylinder_4_port.identificator.label = "Cylinder 4 injector"
+    fuel_tank.add_port(fuel_to_cylinder_4_port.identificator.id)
+
+    cylinder_1_to_exhaust_port = Port(
+        systemic_space,
+        exhaust_manifold.identificator.id,
+    )
+    cylinder_1_to_exhaust_port.identificator.label = "Cylinder 1 exhaust"
+    cylinder_1_flow.add_port(cylinder_1_to_exhaust_port.identificator.id)
+    cylinder_2_to_exhaust_port = Port(
+        systemic_space,
+        exhaust_manifold.identificator.id,
+    )
+    cylinder_2_to_exhaust_port.identificator.label = "Cylinder 2 exhaust"
+    cylinder_2_flow.add_port(cylinder_2_to_exhaust_port.identificator.id)
+    cylinder_3_to_exhaust_port = Port(
+        systemic_space,
+        exhaust_manifold.identificator.id,
+    )
+    cylinder_3_to_exhaust_port.identificator.label = "Cylinder 3 exhaust"
+    cylinder_3_flow.add_port(cylinder_3_to_exhaust_port.identificator.id)
+    cylinder_4_to_exhaust_port = Port(
+        systemic_space,
+        exhaust_manifold.identificator.id,
+    )
+    cylinder_4_to_exhaust_port.identificator.label = "Cylinder 4 exhaust"
+    cylinder_4_flow.add_port(cylinder_4_to_exhaust_port.identificator.id)
+    exhaust_to_tailpipe_port = Port(systemic_space, tailpipe.identificator.id)
+    exhaust_to_tailpipe_port.identificator.label = "Exhaust outlet"
+    exhaust_manifold.add_port(exhaust_to_tailpipe_port.identificator.id)
+
+    intake_flow_bus = FlowBusStructure(systemic_space)
+    intake_flow_bus.add_node(ambient_air.identificator.id)
+    intake_flow_bus.add_node(intake_manifold.identificator.id)
+    intake_flow_bus.add_node(fuel_tank.identificator.id)
+    intake_flow_bus.add_node(cylinder_1_flow.identificator.id)
+    intake_flow_bus.add_node(cylinder_2_flow.identificator.id)
+    intake_flow_bus.add_node(cylinder_3_flow.identificator.id)
+    intake_flow_bus.add_node(cylinder_4_flow.identificator.id)
+    ambient_to_manifold = ContinuousFlowRelation(
+        systemic_space,
+        ambient_air.identificator.id,
+        ambient_air_mass.identificator.id,
+        intake_manifold.identificator.id,
+        manifold_air_mass.identificator.id,
+        rate=lambda _time, _source, _target: (
+            ambient_supply_rate_kg_s
+            * intake_module.system_state.read_value(
+                throttle_position.identificator.id,
+            )
+        ),
+        label="ambient-air-to-manifold",
+        port_id=ambient_to_manifold_port.identificator.id,
+    )
+    manifold_to_cylinder_1 = ContinuousFlowRelation(
+        systemic_space,
+        intake_manifold.identificator.id,
+        manifold_air_mass.identificator.id,
+        cylinder_1_flow.identificator.id,
+        cylinder_1_air_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_1.system_state.read_value(valve_1_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="manifold-to-cylinder-1-air",
+        port_id=manifold_to_cylinder_1_port.identificator.id,
+    )
+    manifold_to_cylinder_2 = ContinuousFlowRelation(
+        systemic_space,
+        intake_manifold.identificator.id,
+        manifold_air_mass.identificator.id,
+        cylinder_2_flow.identificator.id,
+        cylinder_2_air_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_2.system_state.read_value(valve_2_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="manifold-to-cylinder-2-air",
+        port_id=manifold_to_cylinder_2_port.identificator.id,
+    )
+    manifold_to_cylinder_3 = ContinuousFlowRelation(
+        systemic_space,
+        intake_manifold.identificator.id,
+        manifold_air_mass.identificator.id,
+        cylinder_3_flow.identificator.id,
+        cylinder_3_air_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_3.system_state.read_value(valve_3_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="manifold-to-cylinder-3-air",
+        port_id=manifold_to_cylinder_3_port.identificator.id,
+    )
+    manifold_to_cylinder_4 = ContinuousFlowRelation(
+        systemic_space,
+        intake_manifold.identificator.id,
+        manifold_air_mass.identificator.id,
+        cylinder_4_flow.identificator.id,
+        cylinder_4_air_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_4.system_state.read_value(valve_4_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="manifold-to-cylinder-4-air",
+        port_id=manifold_to_cylinder_4_port.identificator.id,
+    )
+    fuel_to_cylinder_1 = ContinuousFlowRelation(
+        systemic_space,
+        fuel_tank.identificator.id,
+        fuel_tank_mass.identificator.id,
+        cylinder_1_flow.identificator.id,
+        cylinder_1_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                / stoichiometric_air_fuel_ratio
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_1.system_state.read_value(valve_1_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="injector-to-cylinder-1-fuel",
+        port_id=fuel_to_cylinder_1_port.identificator.id,
+    )
+    fuel_to_cylinder_2 = ContinuousFlowRelation(
+        systemic_space,
+        fuel_tank.identificator.id,
+        fuel_tank_mass.identificator.id,
+        cylinder_2_flow.identificator.id,
+        cylinder_2_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                / stoichiometric_air_fuel_ratio
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_2.system_state.read_value(valve_2_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="injector-to-cylinder-2-fuel",
+        port_id=fuel_to_cylinder_2_port.identificator.id,
+    )
+    fuel_to_cylinder_3 = ContinuousFlowRelation(
+        systemic_space,
+        fuel_tank.identificator.id,
+        fuel_tank_mass.identificator.id,
+        cylinder_3_flow.identificator.id,
+        cylinder_3_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                / stoichiometric_air_fuel_ratio
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_3.system_state.read_value(valve_3_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="injector-to-cylinder-3-fuel",
+        port_id=fuel_to_cylinder_3_port.identificator.id,
+    )
+    fuel_to_cylinder_4 = ContinuousFlowRelation(
+        systemic_space,
+        fuel_tank.identificator.id,
+        fuel_tank_mass.identificator.id,
+        cylinder_4_flow.identificator.id,
+        cylinder_4_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: (
+            min(
+                cylinder_air_flow_rate_kg_s
+                / stoichiometric_air_fuel_ratio
+                * intake_module.system_state.read_value(
+                    throttle_position.identificator.id,
+                ),
+                0.999 * source / engine_sampling_interval,
+            )
+            * valves_4.system_state.read_value(valve_4_intake.identificator.id)
+            / max(
+                1.0,
+                valves_1.system_state.read_value(valve_1_intake.identificator.id)
+                + valves_2.system_state.read_value(valve_2_intake.identificator.id)
+                + valves_3.system_state.read_value(valve_3_intake.identificator.id)
+                + valves_4.system_state.read_value(valve_4_intake.identificator.id),
+            )
+        ),
+        label="injector-to-cylinder-4-fuel",
+        port_id=fuel_to_cylinder_4_port.identificator.id,
+    )
+    intake_flow_bus.add_relation(ambient_to_manifold.identificator.id)
+    intake_flow_bus.add_relation(manifold_to_cylinder_1.identificator.id)
+    intake_flow_bus.add_relation(manifold_to_cylinder_2.identificator.id)
+    intake_flow_bus.add_relation(manifold_to_cylinder_3.identificator.id)
+    intake_flow_bus.add_relation(manifold_to_cylinder_4.identificator.id)
+    intake_flow_bus.add_relation(fuel_to_cylinder_1.identificator.id)
+    intake_flow_bus.add_relation(fuel_to_cylinder_2.identificator.id)
+    intake_flow_bus.add_relation(fuel_to_cylinder_3.identificator.id)
+    intake_flow_bus.add_relation(fuel_to_cylinder_4.identificator.id)
+    intake_system.suscribe_systemic_description(intake_module.system_state.identificator.id)
+    intake_system.suscribe_systemic_description(ambient_air.identificator.id)
+    intake_system.suscribe_systemic_description(ambient_air_state.identificator.id)
+    intake_system.suscribe_systemic_description(intake_manifold.identificator.id)
+    intake_system.suscribe_systemic_description(intake_manifold_state.identificator.id)
+    intake_system.suscribe_systemic_description(fuel_tank.identificator.id)
+    intake_system.suscribe_systemic_description(fuel_tank_state.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_1_flow.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_1_flow_state.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_2_flow.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_2_flow_state.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_3_flow.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_3_flow_state.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_4_flow.identificator.id)
+    intake_system.suscribe_systemic_description(cylinder_4_flow_state.identificator.id)
+    intake_system.suscribe_systemic_description(intake_flow_bus.identificator.id)
+    intake_system.semantics.add_part(intake_system.identificator.id, ambient_air.identificator.id)
+    intake_system.semantics.add_part(
+        intake_system.identificator.id,
+        intake_manifold.identificator.id,
+    )
+    intake_system.semantics.add_part(intake_system.identificator.id, fuel_tank.identificator.id)
+    intake_system.semantics.add_part(
+        intake_system.identificator.id,
+        cylinder_1_flow.identificator.id,
+    )
+    intake_system.semantics.add_part(
+        intake_system.identificator.id,
+        cylinder_2_flow.identificator.id,
+    )
+    intake_system.semantics.add_part(
+        intake_system.identificator.id,
+        cylinder_3_flow.identificator.id,
+    )
+    intake_system.semantics.add_part(
+        intake_system.identificator.id,
+        cylinder_4_flow.identificator.id,
+    )
+    intake_input_ports = intake_system.semantics.define_set("Intake inputs")
+    intake_output_ports = intake_system.semantics.define_set("Intake outputs")
+    intake_system.semantics.add_member(
+        intake_input_ports.id,
+        ambient_to_manifold_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        manifold_to_cylinder_1_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        manifold_to_cylinder_2_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        manifold_to_cylinder_3_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        manifold_to_cylinder_4_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        fuel_to_cylinder_1_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        fuel_to_cylinder_2_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        fuel_to_cylinder_3_port.identificator.id,
+    )
+    intake_system.semantics.add_member(
+        intake_output_ports.id,
+        fuel_to_cylinder_4_port.identificator.id,
+    )
+
+    cylinder_1_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_1_flow.identificator.id,
+        cylinder_1_air_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_air_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_1.system_state.read_value(valve_1_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-1-to-exhaust-air",
+        port_id=cylinder_1_to_exhaust_port.identificator.id,
+    )
+    cylinder_1_fuel_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_1_flow.identificator.id,
+        cylinder_1_fuel_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_1.system_state.read_value(valve_1_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-1-to-exhaust-fuel",
+        port_id=cylinder_1_to_exhaust_port.identificator.id,
+    )
+    cylinder_2_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_2_flow.identificator.id,
+        cylinder_2_air_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_air_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_2.system_state.read_value(valve_2_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-2-to-exhaust-air",
+        port_id=cylinder_2_to_exhaust_port.identificator.id,
+    )
+    cylinder_2_fuel_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_2_flow.identificator.id,
+        cylinder_2_fuel_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_2.system_state.read_value(valve_2_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-2-to-exhaust-fuel",
+        port_id=cylinder_2_to_exhaust_port.identificator.id,
+    )
+    cylinder_3_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_3_flow.identificator.id,
+        cylinder_3_air_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_air_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_3.system_state.read_value(valve_3_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-3-to-exhaust-air",
+        port_id=cylinder_3_to_exhaust_port.identificator.id,
+    )
+    cylinder_3_fuel_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_3_flow.identificator.id,
+        cylinder_3_fuel_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_3.system_state.read_value(valve_3_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-3-to-exhaust-fuel",
+        port_id=cylinder_3_to_exhaust_port.identificator.id,
+    )
+    cylinder_4_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_4_flow.identificator.id,
+        cylinder_4_air_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_air_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_4.system_state.read_value(valve_4_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-4-to-exhaust-air",
+        port_id=cylinder_4_to_exhaust_port.identificator.id,
+    )
+    cylinder_4_fuel_to_exhaust = ContinuousFlowRelation(
+        systemic_space,
+        cylinder_4_flow.identificator.id,
+        cylinder_4_fuel_mass.identificator.id,
+        exhaust_manifold.identificator.id,
+        exhaust_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_flow_rate_kg_s
+            * valves_4.system_state.read_value(valve_4_exhaust.identificator.id),
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="cylinder-4-to-exhaust-fuel",
+        port_id=cylinder_4_to_exhaust_port.identificator.id,
+    )
+    exhaust_to_tailpipe_air = ContinuousFlowRelation(
+        systemic_space,
+        exhaust_manifold.identificator.id,
+        exhaust_air_mass.identificator.id,
+        tailpipe.identificator.id,
+        exhaust_outlet_air_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_outlet_rate_kg_s,
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="exhaust-air-outlet",
+        port_id=exhaust_to_tailpipe_port.identificator.id,
+    )
+    exhaust_to_tailpipe_fuel = ContinuousFlowRelation(
+        systemic_space,
+        exhaust_manifold.identificator.id,
+        exhaust_fuel_mass.identificator.id,
+        tailpipe.identificator.id,
+        exhaust_outlet_fuel_mass.identificator.id,
+        rate=lambda _time, source, _target: min(
+            exhaust_outlet_rate_kg_s,
+            0.999 * source / engine_sampling_interval,
+        ),
+        label="exhaust-fuel-outlet",
+        port_id=exhaust_to_tailpipe_port.identificator.id,
+    )
+    exhaust_flow_bus = FlowBusStructure(systemic_space)
+    exhaust_flow_bus.add_node(cylinder_1_flow.identificator.id)
+    exhaust_flow_bus.add_node(cylinder_2_flow.identificator.id)
+    exhaust_flow_bus.add_node(cylinder_3_flow.identificator.id)
+    exhaust_flow_bus.add_node(cylinder_4_flow.identificator.id)
+    exhaust_flow_bus.add_node(exhaust_manifold.identificator.id)
+    exhaust_flow_bus.add_node(tailpipe.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_1_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_1_fuel_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_2_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_2_fuel_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_3_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_3_fuel_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_4_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(cylinder_4_fuel_to_exhaust.identificator.id)
+    exhaust_flow_bus.add_relation(exhaust_to_tailpipe_air.identificator.id)
+    exhaust_flow_bus.add_relation(exhaust_to_tailpipe_fuel.identificator.id)
+    exhaust_system.suscribe_systemic_description(exhaust_module.system_state.identificator.id)
+    exhaust_system.suscribe_systemic_description(cylinder_1_flow.identificator.id)
+    exhaust_system.suscribe_systemic_description(cylinder_2_flow.identificator.id)
+    exhaust_system.suscribe_systemic_description(cylinder_3_flow.identificator.id)
+    exhaust_system.suscribe_systemic_description(cylinder_4_flow.identificator.id)
+    exhaust_system.suscribe_systemic_description(exhaust_manifold.identificator.id)
+    exhaust_system.suscribe_systemic_description(exhaust_manifold_state.identificator.id)
+    exhaust_system.suscribe_systemic_description(tailpipe.identificator.id)
+    exhaust_system.suscribe_systemic_description(tailpipe_state.identificator.id)
+    exhaust_system.suscribe_systemic_description(exhaust_flow_bus.identificator.id)
+    exhaust_system.semantics.add_part(
+        exhaust_system.identificator.id,
+        cylinder_1_flow.identificator.id,
+    )
+    exhaust_system.semantics.add_part(
+        exhaust_system.identificator.id,
+        cylinder_2_flow.identificator.id,
+    )
+    exhaust_system.semantics.add_part(
+        exhaust_system.identificator.id,
+        cylinder_3_flow.identificator.id,
+    )
+    exhaust_system.semantics.add_part(
+        exhaust_system.identificator.id,
+        cylinder_4_flow.identificator.id,
+    )
+    exhaust_system.semantics.add_part(
+        exhaust_system.identificator.id,
+        exhaust_manifold.identificator.id,
+    )
+    exhaust_system.semantics.add_part(
+        exhaust_system.identificator.id,
+        tailpipe.identificator.id,
+    )
+    exhaust_input_ports = exhaust_system.semantics.define_set("Exhaust inputs")
+    exhaust_output_ports = exhaust_system.semantics.define_set("Exhaust outputs")
+    exhaust_system.semantics.add_member(
+        exhaust_input_ports.id,
+        cylinder_1_to_exhaust_port.identificator.id,
+    )
+    exhaust_system.semantics.add_member(
+        exhaust_input_ports.id,
+        cylinder_2_to_exhaust_port.identificator.id,
+    )
+    exhaust_system.semantics.add_member(
+        exhaust_input_ports.id,
+        cylinder_3_to_exhaust_port.identificator.id,
+    )
+    exhaust_system.semantics.add_member(
+        exhaust_input_ports.id,
+        cylinder_4_to_exhaust_port.identificator.id,
+    )
+    exhaust_system.semantics.add_member(
+        exhaust_output_ports.id,
+        exhaust_to_tailpipe_port.identificator.id,
+    )
+
     # QualitativeDomain clasifica el ángulo local en las cuatro carreras;
     # QualitativeAutomaton declara el orden cíclico entre ellas.
     four_stroke_domain = engine.semantics.define_qualitative_domain(
@@ -3995,7 +5989,6 @@ if __name__ == "__main__":
         },
     )
 
-    engine_sampling_interval = 0.0025
     crank_interval = ProcessTrigger(
         systemic_space, ProcessTriggerKind.INTERVAL,
         interval=engine_sampling_interval, initial_delay=0,
@@ -4010,6 +6003,70 @@ if __name__ == "__main__":
     engine_process.add_trigger(crank_interval.identificator.id)
     engine_process.add_action(propagate_couplings.identificator.id)
     engine.suscribe_systemic_description(engine_process.identificator.id)
+
+    timing_chain_trigger = ProcessTrigger(
+        systemic_space,
+        ProcessTriggerKind.INTERVAL,
+        interval=engine_sampling_interval,
+        initial_delay=0,
+    )
+    timing_chain_propagation = ProcessAction(
+        systemic_space,
+        ProcessActionKind.PROPAGATE_STATE_COUPLINGS,
+        structure_id=timing_drive.identificator.id,
+    )
+    timing_chain_process = Process(
+        systemic_space,
+        timing_chain_system.identificator.id,
+        label="Timing-chain kinematics",
+    )
+    timing_chain_process.add_trigger(timing_chain_trigger.identificator.id)
+    timing_chain_process.add_action(timing_chain_propagation.identificator.id)
+    timing_chain_system.suscribe_systemic_description(
+        timing_chain_process.identificator.id,
+    )
+
+    intake_flow_trigger = ProcessTrigger(
+        systemic_space,
+        ProcessTriggerKind.INTERVAL,
+        interval=engine_sampling_interval,
+        initial_delay=0,
+    )
+    advance_intake_flow = ProcessAction(
+        systemic_space,
+        ProcessActionKind.ADVANCE_FLOW_BUS,
+        structure_id=intake_flow_bus.identificator.id,
+        duration=engine_sampling_interval,
+    )
+    intake_flow_process = Process(
+        systemic_space,
+        intake_system.identificator.id,
+        label="Intake continuous flows",
+    )
+    intake_flow_process.add_trigger(intake_flow_trigger.identificator.id)
+    intake_flow_process.add_action(advance_intake_flow.identificator.id)
+    intake_system.suscribe_systemic_description(intake_flow_process.identificator.id)
+
+    exhaust_flow_trigger = ProcessTrigger(
+        systemic_space,
+        ProcessTriggerKind.INTERVAL,
+        interval=engine_sampling_interval,
+        initial_delay=0,
+    )
+    advance_exhaust_flow = ProcessAction(
+        systemic_space,
+        ProcessActionKind.ADVANCE_FLOW_BUS,
+        structure_id=exhaust_flow_bus.identificator.id,
+        duration=engine_sampling_interval,
+    )
+    exhaust_flow_process = Process(
+        systemic_space,
+        exhaust_system.identificator.id,
+        label="Exhaust continuous flows",
+    )
+    exhaust_flow_process.add_trigger(exhaust_flow_trigger.identificator.id)
+    exhaust_flow_process.add_action(advance_exhaust_flow.identificator.id)
+    exhaust_system.suscribe_systemic_description(exhaust_flow_process.identificator.id)
 
     engine_start = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
     starter_trigger = ProcessTrigger(
@@ -4038,6 +6095,32 @@ if __name__ == "__main__":
     starter_process.add_action(start_crankshaft.identificator.id)
     engine.suscribe_systemic_description(starter_process.identificator.id)
 
+    throttle_trigger = ProcessTrigger(
+        systemic_space,
+        ProcessTriggerKind.CALENDAR,
+        scheduled_at=engine_start + timedelta(seconds=0.25),
+    )
+    open_throttle_value = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.CONSTANT,
+        value=0.75,
+    )
+    open_throttle = ProcessAction(
+        systemic_space,
+        ProcessActionKind.SET_STATE_VALUE,
+        expression_id=open_throttle_value.identificator.id,
+        state_id=intake_module.system_state.identificator.id,
+        element_id=throttle_position.identificator.id,
+    )
+    throttle_process = Process(
+        systemic_space,
+        engine.identificator.id,
+        label="Driver throttle step",
+    )
+    throttle_process.add_trigger(throttle_trigger.identificator.id)
+    throttle_process.add_action(open_throttle.identificator.id)
+    engine.suscribe_systemic_description(throttle_process.identificator.id)
+
     crank_angle_ref = ProcessValueRef(
         systemic_space,
         ProcessValueScope.SYSTEM_STATE,
@@ -4048,27 +6131,6 @@ if __name__ == "__main__":
         systemic_space,
         ProcessExpressionOperator.READ,
         value_ref_id=crank_angle_ref.identificator.id,
-    )
-    # Tolerance keeps the sampled cycle condition robust against ODE roundoff.
-    cycle_limit = ProcessExpression(
-        systemic_space,
-        ProcessExpressionOperator.CONSTANT,
-        value=720 - 1e-6,
-    )
-    cycle_complete = ProcessCondition(
-        systemic_space,
-        ProcessConditionOperator.GREATER_EQUAL,
-        (crank_angle_value.identificator.id, cycle_limit.identificator.id),
-    )
-    cycle_trigger = ProcessTrigger(
-        systemic_space,
-        ProcessTriggerKind.CONDITION,
-        condition_id=cycle_complete.identificator.id,
-    )
-    reset_angle = ProcessExpression(
-        systemic_space,
-        ProcessExpressionOperator.CONSTANT,
-        value=0,
     )
     cycle_count_ref = ProcessValueRef(
         systemic_space,
@@ -4091,12 +6153,28 @@ if __name__ == "__main__":
         ProcessExpressionOperator.ADD,
         operands=(cycle_count_value.identificator.id, one_cycle.identificator.id),
     )
-    reset_crank_angle = ProcessAction(
+    degrees_per_cycle = ProcessExpression(
         systemic_space,
-        ProcessActionKind.SET_STATE_VALUE,
-        expression_id=reset_angle.identificator.id,
-        state_id=crankshaft.system_state.identificator.id,
-        element_id=crank_angle.identificator.id,
+        ProcessExpressionOperator.CONSTANT,
+        value=720,
+    )
+    cycle_limit = ProcessExpression(
+        systemic_space,
+        ProcessExpressionOperator.MULTIPLY,
+        operands=(
+            next_cycle_count.identificator.id,
+            degrees_per_cycle.identificator.id,
+        ),
+    )
+    cycle_complete = ProcessCondition(
+        systemic_space,
+        ProcessConditionOperator.GREATER_EQUAL,
+        (crank_angle_value.identificator.id, cycle_limit.identificator.id),
+    )
+    cycle_trigger = ProcessTrigger(
+        systemic_space,
+        ProcessTriggerKind.CONDITION,
+        condition_id=cycle_complete.identificator.id,
     )
     increment_cycle_count = ProcessAction(
         systemic_space,
@@ -4111,17 +6189,33 @@ if __name__ == "__main__":
         label="Four-stroke cycle boundary",
     )
     cycle_process.add_trigger(cycle_trigger.identificator.id)
-    cycle_process.add_action(reset_crank_angle.identificator.id)
     cycle_process.add_action(increment_cycle_count.identificator.id)
-    cycle_process.add_action(propagate_couplings.identificator.id)
     engine.suscribe_systemic_description(cycle_process.identificator.id)
 
+    timing_drive.propagate()
     coupling.propagate()
     engine_history = engine.enable_history()
-    simulation = sim.Environment()
-    simulation = engine.run_simpy(
+    engine_simulation = engine.run_simpy(
         until=0.000001,
-        environment=simulation,
+        environment=sim.Environment(),
+        calendar_origin=engine_start,
+        condition_interval=engine_sampling_interval,
+    )
+    timing_chain_simulation = timing_chain_system.run_simpy(
+        until=0.000001,
+        environment=sim.Environment(),
+        calendar_origin=engine_start,
+        condition_interval=engine_sampling_interval,
+    )
+    intake_simulation = intake_system.run_simpy(
+        until=0.000001,
+        environment=sim.Environment(),
+        calendar_origin=engine_start,
+        condition_interval=engine_sampling_interval,
+    )
+    exhaust_simulation = exhaust_system.run_simpy(
+        until=0.000001,
+        environment=sim.Environment(),
         calendar_origin=engine_start,
         condition_interval=engine_sampling_interval,
     )
@@ -4132,25 +6226,166 @@ if __name__ == "__main__":
         "intake",
     )
 
+    def crankshaft_derivatives(_time, values):
+        crank_angle_deg = values[0]
+        crank_velocity_deg_s = values[1]
+        cylinder_1_phase_deg = (crank_angle_deg + 360) % 720
+        cylinder_2_phase_deg = (crank_angle_deg + 540) % 720
+        cylinder_3_phase_deg = (crank_angle_deg + 180) % 720
+        cylinder_4_phase_deg = crank_angle_deg % 720
+        cylinder_1_fuel_energy = indicated_thermal_efficiency * min(
+            cylinder_1_flow_state.read_value(cylinder_1_fuel_mass.identificator.id)
+            * fuel_lower_heating_value_j_kg,
+            cylinder_1_flow_state.read_value(cylinder_1_air_mass.identificator.id)
+            / stoichiometric_air_fuel_ratio
+            * fuel_lower_heating_value_j_kg,
+        )
+        cylinder_2_fuel_energy = indicated_thermal_efficiency * min(
+            cylinder_2_flow_state.read_value(cylinder_2_fuel_mass.identificator.id)
+            * fuel_lower_heating_value_j_kg,
+            cylinder_2_flow_state.read_value(cylinder_2_air_mass.identificator.id)
+            / stoichiometric_air_fuel_ratio
+            * fuel_lower_heating_value_j_kg,
+        )
+        cylinder_3_fuel_energy = indicated_thermal_efficiency * min(
+            cylinder_3_flow_state.read_value(cylinder_3_fuel_mass.identificator.id)
+            * fuel_lower_heating_value_j_kg,
+            cylinder_3_flow_state.read_value(cylinder_3_air_mass.identificator.id)
+            / stoichiometric_air_fuel_ratio
+            * fuel_lower_heating_value_j_kg,
+        )
+        cylinder_4_fuel_energy = indicated_thermal_efficiency * min(
+            cylinder_4_flow_state.read_value(cylinder_4_fuel_mass.identificator.id)
+            * fuel_lower_heating_value_j_kg,
+            cylinder_4_flow_state.read_value(cylinder_4_air_mass.identificator.id)
+            / stoichiometric_air_fuel_ratio
+            * fuel_lower_heating_value_j_kg,
+        )
+        cylinder_1_torque = (
+            0.5
+            * cylinder_1_fuel_energy
+            * np.sin(np.deg2rad(cylinder_1_phase_deg - 360))
+            if 360 <= cylinder_1_phase_deg <= 540
+            else 0.0
+        )
+        cylinder_2_torque = (
+            0.5
+            * cylinder_2_fuel_energy
+            * np.sin(np.deg2rad(cylinder_2_phase_deg - 360))
+            if 360 <= cylinder_2_phase_deg <= 540
+            else 0.0
+        )
+        cylinder_3_torque = (
+            0.5
+            * cylinder_3_fuel_energy
+            * np.sin(np.deg2rad(cylinder_3_phase_deg - 360))
+            if 360 <= cylinder_3_phase_deg <= 540
+            else 0.0
+        )
+        cylinder_4_torque = (
+            0.5
+            * cylinder_4_fuel_energy
+            * np.sin(np.deg2rad(cylinder_4_phase_deg - 360))
+            if 360 <= cylinder_4_phase_deg <= 540
+            else 0.0
+        )
+        combustion_torque = (
+            cylinder_1_torque
+            + cylinder_2_torque
+            + cylinder_3_torque
+            + cylinder_4_torque
+        )
+        angular_velocity_rad_s = np.deg2rad(crank_velocity_deg_s)
+        friction_torque = (
+            friction_torque_nm
+            + viscous_friction_nm_per_rad_s * angular_velocity_rad_s
+        )
+        net_torque = combustion_torque - friction_torque - external_load_torque_nm
+        delivered_torque = max(0.0, net_torque)
+        return (
+            crank_velocity_deg_s,
+            np.rad2deg(net_torque / crankshaft_inertia_kg_m2),
+            delivered_torque * angular_velocity_rad_s,
+        )
+
     crank_integrator = ODEIntegrator(
         crankshaft.system_state,
-        (crank_angle.identificator.id, crank_velocity.identificator.id),
-        lambda _time, values: (values[1], 0.0),
+        (
+            crank_angle.identificator.id,
+            crank_velocity.identificator.id,
+            shaft_energy.identificator.id,
+        ),
+        crankshaft_derivatives,
     )
     engine_step = engine_sampling_interval
-    print("\nL4 OHV: temporal integration over four cycles")
-    print("t_sim | simulated date | cycle | phase | crank | cam | cylinder 1 pressure")
-    for step in range(1, 161):
+    engine_duration = 1.0
+    engine_steps = int(engine_duration / engine_step)
+    time_samples = [0.0]
+    speed_samples_rpm = [
+        crankshaft.system_state.read_value(crank_velocity.identificator.id) / 6
+    ]
+    energy_samples_j = [
+        crankshaft.system_state.read_value(shaft_energy.identificator.id)
+    ]
+    power_samples_w = [0.0]
+    pressure_1_samples_bar = [
+        combustion_1.system_state.read_value(pressure_1.identificator.id)
+    ]
+    manifold_air_samples_kg = [
+        intake_manifold_state.read_value(manifold_air_mass.identificator.id)
+    ]
+    exhaust_outlet_samples_kg = [
+        tailpipe_state.read_value(exhaust_outlet_air_mass.identificator.id)
+        + tailpipe_state.read_value(exhaust_outlet_fuel_mass.identificator.id)
+    ]
+    print("\nL4 OHV: throttle-dependent four-stroke simulation")
+    print("time | cycle | phase | rpm | crank | cam | cylinder 1 pressure | shaft power")
+    for step in range(1, engine_steps + 1):
         step_start = (step - 1) * engine_step
         step_end = step * engine_step
         crank_trajectory = crank_integrator.integrate(
             (step_start, step_end),
             t_eval=(step_start, step_end),
         )
-        simulation = engine.run_simpy(
+        timing_chain_simulation = timing_chain_system.run_simpy(
             until=step_end + 0.000001,
-            environment=simulation,
+            environment=timing_chain_simulation,
             condition_interval=engine_sampling_interval,
+        )
+        engine_simulation = engine.run_simpy(
+            until=step_end + 0.000001,
+            environment=engine_simulation,
+            condition_interval=engine_sampling_interval,
+        )
+        intake_simulation = intake_system.run_simpy(
+            until=step_end + 0.000001,
+            environment=intake_simulation,
+            condition_interval=engine_sampling_interval,
+        )
+        exhaust_simulation = exhaust_system.run_simpy(
+            until=step_end + 0.000001,
+            environment=exhaust_simulation,
+            condition_interval=engine_sampling_interval,
+        )
+
+        energy_now = crankshaft.system_state.read_value(shaft_energy.identificator.id)
+        time_samples.append(step_end)
+        speed_samples_rpm.append(
+            crankshaft.system_state.read_value(crank_velocity.identificator.id) / 6
+        )
+        energy_samples_j.append(energy_now)
+        power_samples_w.append(
+            (energy_now - energy_samples_j[-2]) / engine_step
+        )
+        pressure_1_samples_bar.append(
+            combustion_1.system_state.read_value(pressure_1.identificator.id)
+        )
+        manifold_air_samples_kg.append(
+            intake_manifold_state.read_value(manifold_air_mass.identificator.id)
+        )
+        exhaust_outlet_samples_kg.append(
+            tailpipe_state.read_value(exhaust_outlet_air_mass.identificator.id)
+            + tailpipe_state.read_value(exhaust_outlet_fuel_mass.identificator.id)
         )
 
         phase_angle = crankshaft.system_state.read_value(crank_angle.identificator.id) % 720
@@ -4178,19 +6413,18 @@ if __name__ == "__main__":
         simulated_datetime = engine.simulation_datetime
         if simulated_datetime is None:
             raise RuntimeError("The calendar clock was not configured.")
-        print(
-            f"{step_end:0.3f}s | {simulated_datetime.isoformat()} | "
-            f"cycle {crankshaft.system_state.read_value(engine_cycles.identificator.id):0.0f} | "
-            f"{crankshaft.system_state.read_discrete_value(engine_phase.identificator.id)} | "
-            f"crank {phase_angle:06.2f} deg | "
-            f"cam {camshaft.system_state.read_value(cam_angle.identificator.id):06.2f} deg | "
-            f"C1 {combustion_1.system_state.read_value(pressure_1.identificator.id):04.2f} bar | "
-            f"cylinders [{cylinder_1.system_state.read_value(cylinder_1_phase.identificator.id):06.2f}, "
-            f"{cylinder_2.system_state.read_value(cylinder_2_phase.identificator.id):06.2f}, "
-            f"{cylinder_3.system_state.read_value(cylinder_3_phase.identificator.id):06.2f}, "
-            f"{cylinder_4.system_state.read_value(cylinder_4_phase.identificator.id):06.2f}] deg | "
-            f"ODE {len(crank_trajectory.times)} samples"
-        )
+        if step % 40 == 0:
+            print(
+                f"{step_end:0.3f}s | "
+                f"cycle {crankshaft.system_state.read_value(engine_cycles.identificator.id):0.0f} | "
+                f"{crankshaft.system_state.read_discrete_value(engine_phase.identificator.id)} | "
+                f"{speed_samples_rpm[-1]:0.0f} rpm | "
+                f"crank {phase_angle:06.2f} deg | "
+                f"cam {camshaft.system_state.read_value(cam_angle.identificator.id):06.2f} deg | "
+                f"C1 {pressure_1_samples_bar[-1]:04.2f} bar | "
+                f"{power_samples_w[-1]:0.0f} W | "
+                f"ODE {len(crank_trajectory.times)} samples"
+            )
 
     final_simulated_datetime = engine.simulation_datetime
     if final_simulated_datetime is None:
@@ -4201,6 +6435,41 @@ if __name__ == "__main__":
         crankshaft.system_state.read_value(engine_cycles.identificator.id),
     )
     print("Final simulated date:", final_simulated_datetime.isoformat())
+    initial_speed_rpm = speed_samples_rpm[0]
+    final_speed_rpm = speed_samples_rpm[-1]
+    produced_energy_j = energy_samples_j[-1]
+    mean_shaft_power_w = produced_energy_j / engine_duration
+    peak_shaft_power_w = max(power_samples_w)
+    consumed_air_kg = 2.0 - ambient_air_state.read_value(ambient_air_mass.identificator.id)
+    injected_fuel_kg = 0.25 - fuel_tank_state.read_value(fuel_tank_mass.identificator.id)
+    discharged_exhaust_kg = (
+        tailpipe_state.read_value(exhaust_outlet_air_mass.identificator.id)
+        + tailpipe_state.read_value(exhaust_outlet_fuel_mass.identificator.id)
+    )
+    expected_cam_angle = (
+        crankshaft.system_state.read_value(crank_angle.identificator.id) % 720
+    ) / 2
+    actual_cam_angle = camshaft.system_state.read_value(cam_angle.identificator.id)
+    if not np.isclose(actual_cam_angle, expected_cam_angle, atol=1e-6):
+        raise RuntimeError("The timing chain lost the 2:1 crank-to-cam synchronization.")
+    if final_speed_rpm <= initial_speed_rpm:
+        raise RuntimeError("The throttle step did not accelerate the crankshaft.")
+    if produced_energy_j <= 0 or mean_shaft_power_w <= 0:
+        raise RuntimeError("The engine did not deliver positive shaft energy.")
+    if consumed_air_kg <= 0 or injected_fuel_kg <= 0 or discharged_exhaust_kg <= 0:
+        raise RuntimeError("The intake and exhaust flow paths did not transfer mass.")
+    print(
+        f"Engine speed: {initial_speed_rpm:.0f} -> {final_speed_rpm:.0f} rpm "
+        f"(throttle {initial_throttle_position:.2f} -> "
+        f"{intake_module.system_state.read_value(throttle_position.identificator.id):.2f})"
+    )
+    print(f"Valve estimate: 4 cylinders x 2 valves = {engine.semantic_attributes['total_valves']}")
+    print(f"Intake air delivered: {consumed_air_kg:.6f} kg")
+    print(f"Fuel injected: {injected_fuel_kg:.6f} kg")
+    print(f"Exhaust discharged: {discharged_exhaust_kg:.6f} kg")
+    print(f"Mechanical shaft energy: {produced_energy_j:.2f} J")
+    print(f"Mean / peak shaft power: {mean_shaft_power_w:.2f} / {peak_shaft_power_w:.2f} W")
+    print(f"Mechanical energy: {produced_energy_j / 3_600_000:.8f} kWh")
     print("Trajectory samples:", len(engine_history.samples))
     print("Discrete phase transitions:", len(engine_history.discrete_events))
 
@@ -4263,4 +6532,51 @@ if __name__ == "__main__":
     piston_4_axis.grid(True)
     piston_figure.suptitle("Piston motion")
     piston_figure.tight_layout()
+    piston_figure.savefig("piston_trajectories.png", dpi=150)
+
+    engine_figure, (
+        speed_axis,
+        power_axis,
+        energy_axis,
+        pressure_axis,
+    ) = plt.subplots(
+        4,
+        1,
+        sharex=True,
+        num="L4 OHV engine response",
+    )
+    speed_axis.plot(time_samples, speed_samples_rpm)
+    speed_axis.set_ylabel("Speed (rpm)")
+    speed_axis.set_title("Throttle response")
+    speed_axis.grid(True)
+    power_axis.plot(time_samples, power_samples_w)
+    power_axis.set_ylabel("Shaft power (W)")
+    power_axis.grid(True)
+    energy_axis.plot(time_samples, energy_samples_j)
+    energy_axis.set_ylabel("Delivered energy (J)")
+    energy_axis.grid(True)
+    pressure_axis.plot(time_samples, pressure_1_samples_bar)
+    pressure_axis.set_ylabel("C1 pressure (bar)")
+    pressure_axis.set_xlabel("Simulation time (s)")
+    pressure_axis.grid(True)
+    engine_figure.suptitle("Crankshaft dynamics and output")
+    engine_figure.tight_layout()
+    engine_figure.savefig("engine_performance.png", dpi=150)
+
+    flow_figure, (manifold_axis, exhaust_axis) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        num="L4 OHV intake and exhaust flows",
+    )
+    manifold_axis.plot(time_samples, manifold_air_samples_kg)
+    manifold_axis.set_ylabel("Manifold air (kg)")
+    manifold_axis.set_title("Continuous flow inventories")
+    manifold_axis.grid(True)
+    exhaust_axis.plot(time_samples, exhaust_outlet_samples_kg)
+    exhaust_axis.set_ylabel("Exhaust discharged (kg)")
+    exhaust_axis.set_xlabel("Simulation time (s)")
+    exhaust_axis.grid(True)
+    flow_figure.tight_layout()
+    flow_figure.savefig("engine_flows.png", dpi=150)
     plt.show()
